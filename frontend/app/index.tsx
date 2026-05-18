@@ -129,21 +129,48 @@ export default function Regnradar() {
   // Open-Meteo 15-min precipitation forecast — authoritative intensity source
   const [precip, setPrecip] = useState<{ time: number; mmh: number }[]>([]);
   const [precipError, setPrecipError] = useState<string | null>(null);
-  const intensities = useMemo<(number | null)[]>(() => {
-    if (!precip.length) return frames.map(() => null);
-    return frames.map((f) => {
-      let bestDt = Infinity;
-      let bestMmh: number | null = null;
-      for (const p of precip) {
-        const dt = Math.abs(p.time - f.time);
-        if (dt < bestDt) {
-          bestDt = dt;
-          bestMmh = p.mmh;
+  // 30-second tick so the wall-clock-relative slot window slides smoothly.
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setNowTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  // ─── Build the BAR TIMELINE = 15-minute slots spanning now-15min → now+2h ──
+  // This is the source-of-truth for the graph and the animation. Bars are
+  // always ≥ 8 (currently 10 slots @ 15-min spacing over 2h 15min). Each slot
+  // carries an mmh value sampled from Open-Meteo (0 if no data).
+  const slots = useMemo(() => {
+    const nowS = Date.now() / 1000;
+    const stepS = 15 * 60;
+    const start = Math.floor((nowS - 15 * 60) / stepS) * stepS;
+    const end = nowS + 2 * 3600;
+    const out: { time: number; mmh: number; isFuture: boolean }[] = [];
+    for (let t = start; t <= end + 60; t += stepS) {
+      let mmh = 0;
+      if (precip.length) {
+        let bestDt = Infinity;
+        let bestMmh = 0;
+        for (const p of precip) {
+          const dt = Math.abs(p.time - t);
+          if (dt < bestDt) {
+            bestDt = dt;
+            bestMmh = p.mmh;
+          }
         }
+        // Snap only when within ±10 min of the slot, otherwise leave at 0.
+        if (bestDt <= 10 * 60) mmh = bestMmh;
       }
-      return bestMmh;
-    });
-  }, [frames, precip]);
+      out.push({ time: t, mmh, isFuture: t > nowS });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [precip, nowTick]);
+  // intensities (per radar-frame) is no longer used for bars, but kept for any
+  // legacy consumers (currently none). Bars come from `slots` above.
+  const intensities = useMemo<(number | null)[]>(
+    () => frames.map(() => null),
+    [frames]
+  );
   const [graphOpen, setGraphOpen] = useState(true);
   const [warning, setWarning] = useState<{ minutes: number; mmh: number } | null>(null);
   const [pushPermission, setPushPermission] = useState<NotificationPermission>("default");
@@ -313,19 +340,9 @@ export default function Regnradar() {
       }));
       const all = [...past, ...nowcast];
       setFrames(all);
-      setCurrentIdx((idx) => {
-        // On the very first fetch, seek to "now" (last past frame). On every
-        // subsequent refresh, preserve the running animation index — clamped
-        // to the new array length — so the loop continues smoothly through
-        // past → nowcast → wrap, without jumping back to "now".
-        if (firstFetchRef.current && all.length > 0) {
-          firstFetchRef.current = false;
-          const lastPast = past.length - 1;
-          return lastPast >= 0 ? lastPast : 0;
-        }
-        if (!all.length) return 0;
-        return Math.min(idx, all.length - 1);
-      });
+      // currentIdx now indexes `slots` (Open-Meteo timeline), not `frames`,
+      // so we don't reset it here on radar-frame refresh. A separate effect
+      // below seeks to the "now" slot when slots first become available.
     } catch (e) {
       console.warn("RainViewer fetch failed", e);
     }
@@ -345,7 +362,20 @@ export default function Regnradar() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
-    const f = frames[currentIdx];
+    // Find the radar frame whose timestamp is closest to the current slot's
+    // time. This decouples the long animation (cycling through 10 bars over
+    // 2 h 15 min) from the much shorter radar coverage.
+    const slot = slots[currentIdx];
+    if (!slot) return;
+    let f = frames[0];
+    let bestDt = Math.abs(frames[0].time - slot.time);
+    for (let i = 1; i < frames.length; i++) {
+      const dt = Math.abs(frames[i].time - slot.time);
+      if (dt < bestDt) {
+        bestDt = dt;
+        f = frames[i];
+      }
+    }
     if (!f) return;
 
     const TARGET_OPACITY = 0.7;
@@ -440,16 +470,38 @@ export default function Regnradar() {
       }
       if (fallbackId) clearTimeout(fallbackId);
     };
-  }, [frames, currentIdx]);
+  }, [frames, currentIdx, slots]);
 
   // ─── Animation loop ─────────────────────────────────────────────────────────
+  // The animation cycles through `slots` (the 15-min Open-Meteo timeline),
+  // not `frames` (which only spans the radar past+nowcast and can be very
+  // short). Map tile rendering finds the nearest radar frame for each slot.
   useEffect(() => {
-    if (!playing || !frames.length) return;
+    if (!playing || !slots.length) return;
     playTimerRef.current = setInterval(() => {
-      setCurrentIdx((i) => (i + 1) % frames.length);
+      setCurrentIdx((i) => (i + 1) % slots.length);
     }, 400);
     return () => clearInterval(playTimerRef.current);
-  }, [playing, frames.length]);
+  }, [playing, slots.length]);
+
+  // ─── On first slot load, seek to the "now" slot so the user starts at the
+  //     present moment of the timeline (not the leftmost past slot). ─────────
+  useEffect(() => {
+    if (!firstFetchRef.current) return;
+    if (!slots.length) return;
+    firstFetchRef.current = false;
+    const nowS = Date.now() / 1000;
+    let bestIdx = 0;
+    let bestDt = Infinity;
+    for (let i = 0; i < slots.length; i++) {
+      const dt = Math.abs(slots[i].time - nowS);
+      if (dt < bestDt) {
+        bestDt = dt;
+        bestIdx = i;
+      }
+    }
+    setCurrentIdx(bestIdx);
+  }, [slots.length]);
 
   // ─── Fetch precipitation forecast from Open-Meteo (every 15 min) ────────────
   useEffect(() => {
@@ -563,26 +615,11 @@ export default function Regnradar() {
     }
   }, [precip]);
 
-  // ─── Current intensity — radar for past frames, Open-Meteo for forecast ────
-  // Re-evaluate every 30s so the readout follows wall-clock time when idle.
-  const [, setNowTick] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setNowTick((n) => n + 1), 30_000);
-    return () => clearInterval(id);
-  }, []);
+  // ─── Current intensity — slot-based readout, refreshes via the `nowTick`
+  //    state above (re-evaluated as `slots` recomputes every 30 s). ──────────
   const currentMmh = useMemo(() => {
-    // intensities is already aligned with frames; just read the current slot.
-    const v = intensities[currentIdx];
-    if (v != null) return v;
-    // Fallback: nearest non-null intensity, then 0.
-    for (let i = currentIdx; i >= 0; i--) {
-      if (intensities[i] != null) return intensities[i] as number;
-    }
-    for (let i = currentIdx; i < intensities.length; i++) {
-      if (intensities[i] != null) return intensities[i] as number;
-    }
-    return 0;
-  }, [intensities, currentIdx]);
+    return slots[currentIdx]?.mmh ?? 0;
+  }, [slots, currentIdx]);
 
   // Tween the displayed mm/h value smoothly when target changes
   const [displayedMmh, setDisplayedMmh] = useState(0);
@@ -630,8 +667,14 @@ export default function Regnradar() {
   };
 
   // ─── Render ─────────────────────────────────────────────────────────────────
-  const currentFrame = frames[currentIdx];
-  const isFuture = currentFrame?.isNowcast;
+  // currentFrame is now derived from the current SLOT (Open-Meteo timeline)
+  // rather than the radar `frames` array. The badge shows the slot time so
+  // the animation feels like scrubbing along a full ±2h timeline.
+  const currentSlot = slots[currentIdx];
+  const currentFrame = currentSlot
+    ? { time: currentSlot.time, isNowcast: currentSlot.isFuture }
+    : null;
+  const isFuture = currentSlot?.isFuture;
 
   return (
     <div
@@ -927,9 +970,7 @@ export default function Regnradar() {
         {graphOpen && (
           <div data-testid="rain-graph" style={{ padding: "0 12px 12px" }}>
             <RainGraph
-              frames={frames}
-              intensities={intensities}
-              precip={precip}
+              slots={slots}
               precipError={precipError}
               currentIdx={currentIdx}
             />
@@ -1139,27 +1180,22 @@ function Timeline({
 }
 
 function RainGraph({
-  frames,
-  intensities,
-  precip,
+  slots,
   precipError,
   currentIdx,
 }: {
-  frames: any[];
-  intensities: (number | null)[];
-  precip: { time: number; mmh: number }[];
+  slots: { time: number; mmh: number; isFuture: boolean }[];
   precipError?: string | null;
   currentIdx: number;
 }) {
-  // 30-second tick so the wall-clock-relative "PROGNOS" boundary and the
-  // bar/now alignment drift smoothly with time.
+  // 30-second tick so the wall-clock-relative bar styling refreshes smoothly.
   const [, setTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setTick((t) => t + 1), 30_000);
     return () => clearInterval(id);
   }, []);
 
-  if (!frames.length) {
+  if (!slots.length) {
     return (
       <div
         style={{
@@ -1185,14 +1221,11 @@ function RainGraph({
 
   // ── Dynamic Y scale: peak * 1.25 with floor of 2.5 mm/h so the default
   //    "Duggregn / Lätt regn / Måttligt" band is visible when there's no rain.
-  const peak = Math.max(
-    0,
-    ...intensities.map((v) => v ?? 0)
-  );
+  const peak = Math.max(0, ...slots.map((s) => s.mmh));
   const maxMmh = Math.max(2.5, peak * 1.25);
   const graphH = 120;
   const yFor = (v: number) => (1 - v / maxMmh) * graphH;
-  const labelEvery = Math.max(1, Math.floor(frames.length / 6));
+  const labelEvery = Math.max(1, Math.floor(slots.length / 6));
 
   // Intensity reference lines (mm/h). Shown only when they fit within the
   // current Y range.
@@ -1254,21 +1287,20 @@ function RainGraph({
             </div>
           );
         })}
-        {/* Bars */}
-        {frames.map((f, i) => {
-          const v = intensities[i];
+        {/* Bars — one per 15-min slot. Even zero-rain bars get a 2 px floor so
+            the graph never looks empty. */}
+        {slots.map((s, i) => {
           const active = i === currentIdx;
-          const h = v != null && v > 0 ? Math.max(2, (v / maxMmh) * (graphH - 4)) : 1;
-          const intensityRatio = (v ?? 0) / Math.max(0.001, maxMmh);
+          const dataH = s.mmh > 0 ? (s.mmh / maxMmh) * (graphH - 4) : 0;
+          const h = Math.max(2, dataH);
+          const intensityRatio = s.mmh / Math.max(0.001, maxMmh);
           const color =
-            v == null
-              ? "#E2E8F0"
-              : v < 0.05
-              ? "#CBD5E1"
+            s.mmh < 0.05
+              ? s.isFuture ? "#CBD5E1" : "#94A3B8"
               : interpolateBlue(intensityRatio);
           return (
             <div
-              key={f.time + "_b_" + i}
+              key={s.time + "_b_" + i}
               data-testid={`bar-${i}`}
               style={{
                 flex: 1,
@@ -1278,11 +1310,11 @@ function RainGraph({
                 minWidth: 2,
                 outline: active ? `2px solid ${PRIMARY}` : "none",
                 outlineOffset: 0,
-                opacity: f.isNowcast ? 0.85 : 1,
+                opacity: s.isFuture ? 0.85 : 1,
                 position: "relative",
-                transition: "height 0.25s ease-out",
+                transition: "height 0.25s ease-out, background 0.25s ease-out",
               }}
-              title={`${formatTime(f.time)} · ${v == null ? "…" : formatMmh(v) + " mm/h"}`}
+              title={`${formatTime(s.time)} · ${formatMmh(s.mmh)} mm/h`}
             />
           );
         })}
@@ -1299,9 +1331,9 @@ function RainGraph({
           color: MUTED,
         }}
       >
-        {frames.map((f, i) => (
+        {slots.map((s, i) => (
           <div
-            key={f.time + "_t_" + i}
+            key={s.time + "_t_" + i}
             style={{
               flex: 1,
               textAlign: "center",
@@ -1311,7 +1343,7 @@ function RainGraph({
               whiteSpace: "nowrap",
             }}
           >
-            {formatTime(f.time)}
+            {formatTime(s.time)}
           </div>
         ))}
       </div>
