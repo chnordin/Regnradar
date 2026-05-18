@@ -14,6 +14,24 @@ const BG = "#F8FAFC";
 const CARD = "#FFFFFF";
 const BORDER = "#E2E8F0";
 
+// ─── Graph layout constants (module-level so DOM-based marker manipulation
+//     outside RainGraph can compute positions consistently). ─────────────────
+const G_W = 1000;
+const G_H = 160;
+const G_PAD_LEFT = 56;
+const G_PAD_RIGHT = 16;
+const G_PAD_TOP = 10;
+const G_PAD_BOTTOM = 22;
+const G_INNER_W = G_W - G_PAD_LEFT - G_PAD_RIGHT;
+const G_INNER_H = G_H - G_PAD_TOP - G_PAD_BOTTOM;
+const G_BASELINE_Y = G_PAD_TOP + G_INNER_H;
+function graphXForTime(t: number): number {
+  const now = Date.now() / 1000;
+  const tMin = now - 15 * 60;
+  const tMax = now + 2 * 3600;
+  return G_PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * G_INNER_W;
+}
+
 // (Removed: radar pixel-sampling helpers — Open-Meteo is now the only
 // precipitation data source for both past and forecast.)
 function _unused_rgbToDbz(r: number, g: number, b: number, a: number): number {
@@ -119,6 +137,31 @@ export default function Regnradar() {
   // "now" on the initial load — subsequent refreshes preserve the running
   // animation index so the loop never resets mid-cycle.
   const firstFetchRef = useRef(true);
+  // ─── Marker DOM refs (graph) ───────────────────────────────────────────────
+  // The graph's current-frame marker is updated by direct DOM manipulation
+  // on every animation tick (no React state, no RAF, no tween). The refs are
+  // assigned by RainGraph via the `markerLineRef` / `markerCircleGroupRef`
+  // props and used here inside the setInterval below.
+  const markerLineRef = useRef<SVGLineElement | null>(null);
+  const markerCircleGroupRef = useRef<SVGGElement | null>(null);
+  const framesRef = useRef<typeof frames>([]);
+  framesRef.current = frames;
+  const setMarkerToIdx = (idx: number) => {
+    const f = framesRef.current[idx];
+    if (!f) return;
+    const x = graphXForTime(f.time);
+    if (!isFinite(x)) return;
+    if (markerLineRef.current) {
+      markerLineRef.current.setAttribute("x1", String(x));
+      markerLineRef.current.setAttribute("x2", String(x));
+    }
+    if (markerCircleGroupRef.current) {
+      markerCircleGroupRef.current.setAttribute(
+        "transform",
+        `translate(${x}, ${G_BASELINE_Y})`
+      );
+    }
+  };
 
   const [intensities] = useState<(number | null)[]>([]);
   // Note: kept as empty array shim — Open-Meteo `precip` is the sole source.
@@ -427,7 +470,13 @@ export default function Regnradar() {
   useEffect(() => {
     if (!playing || !frames.length) return;
     playTimerRef.current = setInterval(() => {
-      setCurrentIdx((i) => (i + 1) % frames.length);
+      setCurrentIdx((i) => {
+        const newIdx = (i + 1) % framesRef.current.length;
+        // Update the graph marker via direct DOM manipulation. No RAF, no
+        // tween, no React state for the marker — just setAttribute.
+        setMarkerToIdx(newIdx);
+        return newIdx;
+      });
     }, 400);
     return () => clearInterval(playTimerRef.current);
   }, [playing, frames.length]);
@@ -920,6 +969,8 @@ export default function Regnradar() {
               precip={precip}
               precipError={precipError}
               currentIdx={currentIdx}
+              markerLineRef={markerLineRef}
+              markerCircleGroupRef={markerCircleGroupRef}
               onScrub={(idx, isFinal) => {
                 if (scrubResumeRef.current) {
                   clearTimeout(scrubResumeRef.current);
@@ -928,7 +979,9 @@ export default function Regnradar() {
                 if (!isFinal) {
                   setPlaying(false);
                   setCurrentIdx(idx);
+                  setMarkerToIdx(idx);
                 } else {
+                  setMarkerToIdx(idx);
                   scrubResumeRef.current = setTimeout(() => {
                     setPlaying(true);
                     scrubResumeRef.current = null;
@@ -1148,6 +1201,8 @@ function RainGraph({
   precipError,
   currentIdx,
   onScrub,
+  markerLineRef,
+  markerCircleGroupRef,
 }: {
   frames: any[];
   intensities: (number | null)[];
@@ -1155,6 +1210,8 @@ function RainGraph({
   precipError?: string | null;
   currentIdx: number;
   onScrub?: (idx: number, isFinal: boolean) => void;
+  markerLineRef?: React.MutableRefObject<SVGLineElement | null>;
+  markerCircleGroupRef?: React.MutableRefObject<SVGGElement | null>;
 }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const scrubbingRef = useRef(false);
@@ -1229,56 +1286,9 @@ function RainGraph({
   const xForTime = (t: number) =>
     PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
 
-  // ── Current frame marker — positioned by the current radar frame's time ────
-  // We tween between consecutive `curX` targets so the marker visually slides
-  // smoothly between frames instead of snapping each animation tick. Hooks
-  // MUST come before any conditional early return below (React rules).
-  const targetCurX = xForTime(frames[currentIdx]?.time ?? tMin);
-  const [animCurX, setAnimCurX] = useState(targetCurX);
-  const animCurXRef = useRef(targetCurX);
-  const targetCurXRef = useRef(targetCurX);
-  // Keep the latest target in a ref so the persistent RAF loop below always
-  // reads the fresh value without needing to re-mount.
-  targetCurXRef.current = targetCurX;
-  // ── Persistent RAF loop that drives the marker position independently of
-  //    React effect dependencies. Each frame we read the latest target from
-  //    `targetCurXRef` (updated on every render via `currentIdx`) and lerp the
-  //    animated value toward it. This guarantees the marker keeps moving on
-  //    iOS Safari even if React's reconciliation is throttled or batched.
-  useEffect(() => {
-    let raf: number | null = null;
-    const tick = () => {
-      const target = targetCurXRef.current;
-      const cur = animCurXRef.current;
-      if (!isFinite(target)) {
-        raf = requestAnimationFrame(tick);
-        return;
-      }
-      if (scrubbingRef.current) {
-        // Snap during scrub for responsive feedback
-        if (cur !== target) {
-          animCurXRef.current = target;
-          setAnimCurX(target);
-        }
-      } else {
-        const delta = target - cur;
-        if (Math.abs(delta) > 0.4) {
-          // Exponential ease-out per frame (≈ 18% closer each tick @ 60fps).
-          const next = cur + delta * 0.18;
-          animCurXRef.current = next;
-          setAnimCurX(next);
-        } else if (cur !== target) {
-          animCurXRef.current = target;
-          setAnimCurX(target);
-        }
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => {
-      if (raf !== null) cancelAnimationFrame(raf);
-    };
-  }, []);
+  // ── Current frame marker is updated by direct DOM manipulation from the
+  //    parent's animation setInterval (no React state, no RAF, no tween).
+  //    The refs are attached to the <line> and <g> elements in JSX below. ──
 
   // ── Scrubbing handlers — defined before the empty-state early return so
   // that the `useRef` and `useEffect` hooks below honor the rules-of-hooks. ──
@@ -1446,27 +1456,10 @@ function RainGraph({
   // Forecast boundary = wall-clock NOW (not the radar nowcast frame boundary).
   const nowcastX = xForTime(now);
 
-  // Marker X is the animated value computed above (tween hook lives before the
-  // empty-state early return to satisfy React's rules-of-hooks).
-  const curX = animCurX;
-  // Interpolate the curve's Y at the marker's X for a nice circle on the path
-  let curY: number | null = null;
-  if (points.length >= 2) {
-    for (let i = 0; i < points.length - 1; i++) {
-      const a = points[i];
-      const b = points[i + 1];
-      if (curX >= a.x && curX <= b.x) {
-        const r = (curX - a.x) / Math.max(1e-6, b.x - a.x);
-        curY = a.y + (b.y - a.y) * r;
-        break;
-      }
-    }
-    if (curY === null) {
-      curY = curX <= points[0].x ? points[0].y : points[points.length - 1].y;
-    }
-  } else if (points.length === 1) {
-    curY = points[0].y;
-  }
+  // Initial marker X: directly from the current frame's timestamp. After
+  // mount, the parent's animation setInterval drives all subsequent updates
+  // via setAttribute on the refs below.
+  const initialMarkerX = xForTime(frames[currentIdx]?.time ?? tMin);
 
   // X-axis labels — pick a few evenly spaced frame times for context
   const labelEvery = Math.max(1, Math.floor(frames.length / 6));
@@ -1625,39 +1618,56 @@ function RainGraph({
           vectorEffect="non-scaling-stroke"
         />
 
-        {/* Current frame indicator */}
+        {/* Current frame indicator — position is driven by direct DOM
+            manipulation (setAttribute on x1/x2 and the group's transform)
+            from the parent's animation setInterval. The `x1`/`x2` JSX values
+            are only the INITIAL position; the parent overrides on every
+            interval tick. */}
         <line
-          x1={curX}
+          ref={(el) => {
+            if (markerLineRef) markerLineRef.current = el;
+            if (el && isFinite(initialMarkerX)) {
+              el.setAttribute("x1", String(initialMarkerX));
+              el.setAttribute("x2", String(initialMarkerX));
+            }
+          }}
           y1={PAD_TOP}
-          x2={curX}
           y2={H - PAD_BOTTOM}
           stroke={PRIMARY}
           strokeWidth={1.5}
           strokeDasharray="3 3"
           vectorEffect="non-scaling-stroke"
-          opacity={0.55}
+          opacity={0.7}
         />
-        {curY != null && (
-          <g>
-            <circle
-              cx={curX}
-              cy={curY}
-              r={9}
-              fill={PRIMARY}
-              fillOpacity={0.2}
-              vectorEffect="non-scaling-stroke"
-            />
-            <circle
-              cx={curX}
-              cy={curY}
-              r={4.5}
-              fill="#fff"
-              stroke={PRIMARY}
-              strokeWidth={2.5}
-              vectorEffect="non-scaling-stroke"
-            />
-          </g>
-        )}
+        <g
+          ref={(el) => {
+            if (markerCircleGroupRef) markerCircleGroupRef.current = el;
+            if (el && isFinite(initialMarkerX)) {
+              el.setAttribute(
+                "transform",
+                `translate(${initialMarkerX}, ${H - PAD_BOTTOM})`
+              );
+            }
+          }}
+        >
+          <circle
+            cx={0}
+            cy={0}
+            r={9}
+            fill={PRIMARY}
+            fillOpacity={0.2}
+            vectorEffect="non-scaling-stroke"
+          />
+          <circle
+            cx={0}
+            cy={0}
+            r={4.5}
+            fill="#fff"
+            stroke={PRIMARY}
+            strokeWidth={2.5}
+            vectorEffect="non-scaling-stroke"
+          />
+        </g>
       </svg>
 
       {/* HTML overlay for non-stretched labels */}
