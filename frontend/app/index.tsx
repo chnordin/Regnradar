@@ -906,31 +906,8 @@ export default function Regnradar() {
         )}
       </div>
 
-      {/* Floating play/pause on the map (no full controls bar — graph handles scrubbing) */}
-      <button
-        data-testid="play-pause-btn"
-        aria-label={playing ? "Pausa" : "Spela"}
-        onClick={togglePlay}
-        style={{
-          position: "absolute",
-          right: 12,
-          bottom: graphOpen ? 224 : 96,
-          width: 44,
-          height: 44,
-          borderRadius: 22,
-          border: "none",
-          background: PRIMARY,
-          color: "#fff",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          boxShadow: "0 4px 14px rgba(37,99,235,0.45)",
-          zIndex: 500,
-          transition: "bottom 0.25s ease",
-        }}
-      >
-        {playing ? <Pause /> : <Play />}
-      </button>
+      {/* Animation loopar automatiskt — ingen manuell play/pause behövs.
+          (Scrub i grafen pausar tillfälligt och återupptar efter 3 s.) */}
 
       {/* Rain graph (collapsible) */}
       <div
@@ -1217,25 +1194,32 @@ function RainGraph({
 
   // ── Build the combined source-of-truth data points ─────────────────────────
   // PAST  → radar pixel-sampled intensity at each past frame's timestamp
-  // FUTURE → Open-Meteo minutely_15 entries after the first nowcast frame
-  const nowcastStartIdx = frames.findIndex((f: any) => f.isNowcast);
-  const nowcastStartTime =
-    nowcastStartIdx >= 0 ? frames[nowcastStartIdx].time : Infinity;
+  // FUTURE → Open-Meteo minutely_15 entries strictly after wall-clock NOW
+  //          (radar nowcast frames are skipped here — Open-Meteo is the
+  //          forecast source so the "PROGNOS" zone is consistent.)
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    // Re-render every 30s so the wall-clock-relative X-axis advances smoothly.
+    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  const now = Date.now() / 1000;
   const combined: { time: number; mmh: number }[] = useMemo(() => {
     const out: { time: number; mmh: number }[] = [];
     for (let i = 0; i < frames.length; i++) {
       const f = frames[i];
       if (f.isNowcast) continue;
+      if (f.time > now) continue;
       const v = intensities[i];
       if (v != null) out.push({ time: f.time, mmh: v });
     }
     for (const p of precip) {
-      if (p.time >= nowcastStartTime - 60) out.push({ time: p.time, mmh: p.mmh });
+      if (p.time > now) out.push({ time: p.time, mmh: p.mmh });
     }
     out.sort((a, b) => a.time - b.time);
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frames, intensities, precip, nowcastStartTime]);
+  }, [frames, intensities, precip, now]);
 
   // ── Animated displayed values, keyed by time ───────────────────────────────
   const [displayed, setDisplayed] = useState<{ time: number; mmh: number }[]>(combined);
@@ -1293,20 +1277,23 @@ function RainGraph({
   const innerW = W - PAD_LEFT - PAD_RIGHT;
   const innerH = H - PAD_TOP - PAD_BOTTOM;
 
-  // ── Time-based X axis: span the radar timeline window ──────────────────────
-  const tMin = frames[0].time;
-  const tMax = frames[frames.length - 1].time;
+  // ── Time-based X axis: ±2h around wall-clock NOW (now sits in the middle) ──
+  const tMin = now - 2 * 3600;
+  const tMax = now + 2 * 3600;
   const xForTime = (t: number) =>
     PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
 
-  const maxMmh = Math.max(
-    5.5,
+  // ── Dynamic Y scale: peak * 1.25 with floor of 5.5 so "kraftigt 5" remains
+  //    visible by default and stronger peaks still fit with headroom above. ──
+  const peak = Math.max(
+    0,
     ...displayed.map((p) => p.mmh),
     ...combined.map((p) => p.mmh)
   );
+  const maxMmh = Math.max(5.5, peak * 1.25);
   const yFor = (v: number) => PAD_TOP + (1 - v / maxMmh) * innerH;
 
-  // Build smooth path through points (sorted, clipped to range)
+  // Build smooth path through points (sorted, clipped to extended range)
   type P = { x: number; y: number };
   const points: P[] = displayed
     .filter((p) => p.time >= tMin - 600 && p.time <= tMax + 600)
@@ -1351,8 +1338,8 @@ function RainGraph({
   const linePath = buildPath(points, false);
   const fillPath = buildPath(points, true);
 
-  // (`nowcastStartIdx` + `nowcastStartTime` are computed above with `combined`.)
-  const nowcastX = nowcastStartIdx >= 0 ? xForTime(frames[nowcastStartIdx].time) : null;
+  // Forecast boundary = wall-clock NOW (not the radar nowcast frame boundary).
+  const nowcastX = xForTime(now);
 
   // ── Current frame marker — positioned by the current radar frame's time ────
   const curT = frames[currentIdx]?.time ?? tMin;
@@ -1488,16 +1475,14 @@ function RainGraph({
         </defs>
 
         {/* Nowcast band background (faint blue tint for the forecast region) */}
-        {nowcastX !== null && (
-          <rect
-            x={nowcastX}
-            y={PAD_TOP}
-            width={W - PAD_RIGHT - nowcastX}
-            height={innerH}
-            fill={PRIMARY}
-            fillOpacity={0.04}
-          />
-        )}
+        <rect
+          x={nowcastX}
+          y={PAD_TOP}
+          width={W - PAD_RIGHT - nowcastX}
+          height={innerH}
+          fill={PRIMARY}
+          fillOpacity={0.04}
+        />
 
         {/* Reference lines */}
         {refs.map((r) => {
@@ -1548,35 +1533,30 @@ function RainGraph({
           />
         )}
 
-        {/* Forecast (Open-Meteo) wash — mute the right portion to distinguish
-            the modelled forecast from the radar-observed past. */}
-        {nowcastX !== null && (
-          <rect
-            x={nowcastX}
-            y={PAD_TOP}
-            width={W - PAD_RIGHT - nowcastX}
-            height={innerH}
-            fill="#ffffff"
-            fillOpacity={0.55}
-            clipPath="url(#graphClip)"
-            pointerEvents="none"
-          />
-        )}
+        {/* Forecast (Open-Meteo) wash — mute the right portion */}
+        <rect
+          x={nowcastX}
+          y={PAD_TOP}
+          width={W - PAD_RIGHT - nowcastX}
+          height={innerH}
+          fill="#ffffff"
+          fillOpacity={0.55}
+          clipPath="url(#graphClip)"
+          pointerEvents="none"
+        />
 
-        {/* Vertical separator between past (radar) and forecast (Open-Meteo) */}
-        {nowcastX !== null && (
-          <line
-            x1={nowcastX}
-            y1={PAD_TOP}
-            x2={nowcastX}
-            y2={H - PAD_BOTTOM}
-            stroke={PRIMARY}
-            strokeWidth={1}
-            strokeDasharray="2 3"
-            strokeOpacity={0.5}
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
+        {/* Vertical separator at wall-clock NOW */}
+        <line
+          x1={nowcastX}
+          y1={PAD_TOP}
+          x2={nowcastX}
+          y2={H - PAD_BOTTOM}
+          stroke={PRIMARY}
+          strokeWidth={1}
+          strokeDasharray="2 3"
+          strokeOpacity={0.5}
+          vectorEffect="non-scaling-stroke"
+        />
 
         {/* Current frame indicator */}
         <line
@@ -1616,26 +1596,24 @@ function RainGraph({
       {/* HTML overlay for non-stretched labels */}
       <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
         {/* "Prognos" pill over the forecast section */}
-        {nowcastX !== null && (
-          <div
-            style={{
-              position: "absolute",
-              left: `calc(${(nowcastX / W) * 100}% + 6px)`,
-              top: 6,
-              fontSize: 10,
-              fontWeight: 600,
-              color: PRIMARY,
-              background: "rgba(255,255,255,0.92)",
-              border: `1px solid ${BORDER}`,
-              padding: "1px 6px",
-              borderRadius: 8,
-              letterSpacing: 0.3,
-              textTransform: "uppercase",
-            }}
-          >
-            Prognos
-          </div>
-        )}
+        <div
+          style={{
+            position: "absolute",
+            left: `calc(${(nowcastX / W) * 100}% + 6px)`,
+            top: 6,
+            fontSize: 10,
+            fontWeight: 600,
+            color: PRIMARY,
+            background: "rgba(255,255,255,0.92)",
+            border: `1px solid ${BORDER}`,
+            padding: "1px 6px",
+            borderRadius: 8,
+            letterSpacing: 0.3,
+            textTransform: "uppercase",
+          }}
+        >
+          Prognos
+        </div>
         {/* Y reference labels */}
         {refs.map((r) => {
           if (r.value > maxMmh) return null;
@@ -1659,28 +1637,36 @@ function RainGraph({
             </div>
           );
         })}
-        {/* X-axis time labels — position by frame time on the new time axis */}
-        {frames.map((f: any, i: number) => {
-          if (i % labelEvery !== 0) return null;
-          const active = i === currentIdx;
-          return (
-            <div
-              key={"xt_" + f.time + "_" + i}
-              style={{
-                position: "absolute",
-                left: `${xPctTime(f.time)}%`,
-                transform: "translateX(-50%)",
-                bottom: 0,
-                fontSize: 11,
-                color: active ? PRIMARY : MUTED,
-                fontWeight: active ? 700 : 500,
-                whiteSpace: "nowrap",
-              }}
-            >
-              {formatTime(f.time)}
-            </div>
-          );
-        })}
+        {/* X-axis time labels — hourly across the now ± 2h window */}
+        {(() => {
+          const out: any[] = [];
+          // Round the first hour mark down from tMin
+          const firstHour = Math.floor(tMin / 3600) * 3600;
+          for (let t = firstHour; t <= tMax + 60; t += 1800) {
+            if (t < tMin) continue;
+            const isOnHour = t % 3600 === 0;
+            const isNow = Math.abs(t - now) < 900; // within 15 min of now
+            out.push(
+              <div
+                key={"xt_" + t}
+                style={{
+                  position: "absolute",
+                  left: `${(xForTime(t) / W) * 100}%`,
+                  transform: "translateX(-50%)",
+                  bottom: 0,
+                  fontSize: isOnHour ? 11 : 10,
+                  color: isNow ? PRIMARY : MUTED,
+                  fontWeight: isNow ? 700 : isOnHour ? 600 : 400,
+                  whiteSpace: "nowrap",
+                  opacity: isOnHour ? 1 : 0.7,
+                }}
+              >
+                {formatTime(t)}
+              </div>
+            );
+          }
+          return out;
+        })()}
       </div>
     </div>
   );
