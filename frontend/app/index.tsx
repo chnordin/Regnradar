@@ -1078,6 +1078,9 @@ function RainGraph({
         : `M ${p.x} ${p.y}`;
     }
     let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
+    const baseY = yFor(0);
+    const topY = PAD_TOP;
+    const clampY = (y: number) => Math.max(topY, Math.min(baseY, y));
     for (let i = 0; i < pts.length - 1; i++) {
       const p0 = pts[i - 1] || pts[i];
       const p1 = pts[i];
@@ -1086,15 +1089,17 @@ function RainGraph({
       // Catmull-Rom to Bézier with tension = 0.5
       const t = 0.5;
       const cp1x = p1.x + ((p2.x - p0.x) / 6) * t * 2;
-      const cp1y = p1.y + ((p2.y - p0.y) / 6) * t * 2;
+      let cp1y = p1.y + ((p2.y - p0.y) / 6) * t * 2;
       const cp2x = p2.x - ((p3.x - p1.x) / 6) * t * 2;
-      const cp2y = p2.y - ((p3.y - p1.y) / 6) * t * 2;
+      let cp2y = p2.y - ((p3.y - p1.y) / 6) * t * 2;
+      // Clamp control-point Y so the curve never overshoots above ceiling or below baseline
+      cp1y = clampY(cp1y);
+      cp2y = clampY(cp2y);
       d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
     }
     if (close) {
       const last = pts[pts.length - 1];
       const first = pts[0];
-      const baseY = yFor(0);
       d += ` L ${last.x.toFixed(2)} ${baseY.toFixed(2)} L ${first.x.toFixed(2)} ${baseY.toFixed(2)} Z`;
     }
     return d;
@@ -1196,6 +1201,15 @@ function RainGraph({
             <stop offset="55%" stopColor={PRIMARY} stopOpacity="0.35" />
             <stop offset="100%" stopColor={PRIMARY} stopOpacity="0.02" />
           </linearGradient>
+          {/* Clip everything that should never render below the baseline or above the ceiling */}
+          <clipPath id="graphClip">
+            <rect
+              x={PAD_LEFT}
+              y={PAD_TOP}
+              width={W - PAD_LEFT - PAD_RIGHT}
+              height={yFor(0) - PAD_TOP}
+            />
+          </clipPath>
         </defs>
 
         {/* Nowcast band background */}
@@ -1240,10 +1254,12 @@ function RainGraph({
           vectorEffect="non-scaling-stroke"
         />
 
-        {/* Area fill */}
-        {points.length > 1 && <path d={fillPath} fill="url(#rainFill)" />}
+        {/* Area fill — clipped so it can never render below baseline */}
+        {points.length > 1 && (
+          <path d={fillPath} fill="url(#rainFill)" clipPath="url(#graphClip)" />
+        )}
 
-        {/* Smooth line on top */}
+        {/* Smooth line on top — also clipped to the plot area */}
         {points.length > 1 && (
           <path
             d={linePath}
@@ -1253,6 +1269,7 @@ function RainGraph({
             strokeLinejoin="round"
             strokeLinecap="round"
             vectorEffect="non-scaling-stroke"
+            clipPath="url(#graphClip)"
           />
         )}
 
