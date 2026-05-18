@@ -1257,14 +1257,15 @@ function RainGraph({
   const xForTime = (t: number) =>
     PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
 
-  // ── Dynamic Y scale: peak * 1.25 with floor of 5.5 so "kraftigt 5" remains
-  //    visible by default and stronger peaks still fit with headroom above. ──
+  // ── Dynamic Y scale: peak * 1.25 with floor of 2.5 mm/h so the default
+  //    "Duggregn / Lätt regn / Måttligt" band is visible when there's no rain,
+  //    and stronger peaks scale up naturally with headroom above. ──
   const peak = Math.max(
     0,
     ...displayed.map((p) => p.mmh),
     ...combined.map((p) => p.mmh)
   );
-  const maxMmh = Math.max(5.5, peak * 1.25);
+  const maxMmh = Math.max(2.5, peak * 1.25);
   const yFor = (v: number) => PAD_TOP + (1 - v / maxMmh) * innerH;
 
   // Build smooth path through points (sorted, clipped to extended range)
@@ -1340,25 +1341,45 @@ function RainGraph({
   // X-axis labels — pick a few evenly spaced frame times for context
   const labelEvery = Math.max(1, Math.floor(frames.length / 6));
 
-  const refs = [
-    { label: "kraftigt", value: 5 },
-    { label: "måttligt", value: 1 },
+  // Intensity reference lines (mm/h). Shown only when they fit within the
+  // current Y range (maxMmh). Ordered descending so we filter by `value <= maxMmh`.
+  const allRefs = [
+    { label: "Skyfall", value: 30 },
+    { label: "Kraftigt", value: 10 },
+    { label: "Måttligt", value: 2 },
+    { label: "Lätt regn", value: 0.5 },
+    { label: "Duggregn", value: 0.1 },
   ];
+  const refs = allRefs.filter((r) => r.value <= maxMmh);
 
   const yPct = (v: number) => ((PAD_TOP + (1 - v / maxMmh) * innerH) / H) * 100;
   const xPctTime = (t: number) => (xForTime(t) / W) * 100;
 
-  // ── Scrubbing: compute frame index from a touch/mouse X position ───────────
+  // ── Scrubbing: map a touch/mouse X position to a TIME within the visible
+  //    window, then snap to the frame whose timestamp is closest. This keeps
+  //    scrubbing responsive even when frames are clustered in a small part of
+  //    the chart (e.g. only 15 min of past + 30 min of nowcast).
   const indexFromClientX = (clientX: number): number => {
     const svg = svgRef.current;
-    if (!svg) return currentIdx;
+    if (!svg || !frames.length) return currentIdx;
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0) return currentIdx;
     const localX = clientX - rect.left;
     const xInVB = (localX / rect.width) * W;
-    const innerX = xInVB - PAD_LEFT;
-    const ratio = Math.max(0, Math.min(1, innerX / innerW));
-    return Math.round(ratio * Math.max(0, frames.length - 1));
+    const innerX = Math.max(0, Math.min(innerW, xInVB - PAD_LEFT));
+    const ratio = innerX / innerW;
+    const targetT = tMin + ratio * (tMax - tMin);
+    // Find frame with timestamp closest to targetT
+    let bestIdx = 0;
+    let bestDt = Infinity;
+    for (let i = 0; i < frames.length; i++) {
+      const dt = Math.abs(frames[i].time - targetT);
+      if (dt < bestDt) {
+        bestDt = dt;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
   };
 
   const handleScrubStart = (clientX: number) => {
@@ -1569,28 +1590,10 @@ function RainGraph({
 
       {/* HTML overlay for non-stretched labels */}
       <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-        {/* "Prognos" pill over the forecast section */}
-        <div
-          style={{
-            position: "absolute",
-            left: `calc(${(nowcastX / W) * 100}% + 6px)`,
-            top: 6,
-            fontSize: 10,
-            fontWeight: 600,
-            color: PRIMARY,
-            background: "rgba(255,255,255,0.92)",
-            border: `1px solid ${BORDER}`,
-            padding: "1px 6px",
-            borderRadius: 8,
-            letterSpacing: 0.3,
-            textTransform: "uppercase",
-          }}
-        >
-          Prognos
-        </div>
+        {/* (Prognos pill removed — forecast zone is visually distinct via the
+            lighter background wash on the right side of the wall-clock divider.) */}
         {/* Y reference labels */}
         {refs.map((r) => {
-          if (r.value > maxMmh) return null;
           return (
             <div
               key={"lbl_" + r.label}
@@ -1607,7 +1610,7 @@ function RainGraph({
                 whiteSpace: "nowrap",
               }}
             >
-              {r.label} {r.value}
+              {r.label} {formatMmh(r.value)}
             </div>
           );
         })}
