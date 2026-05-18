@@ -270,33 +270,43 @@ export default function Regnradar() {
     return () => clearInterval(id);
   }, [fetchFrames]);
 
-  // ─── Render current radar frame as a tile layer (cross-fade) ────────────────
+  // ─── Render current radar frame as a tile layer (preload + cross-fade) ──────
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
     const f = frames[currentIdx];
     if (!f) return;
     const TARGET_OPACITY = 0.7;
-    const FADE_MS = 400;
+    const FADE_MS = 350;
     const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
     const next = L.tileLayer(url, {
       tileSize: 256,
-      opacity: 0,
+      opacity: 0,           // start invisible — fade in only AFTER tiles have loaded
       zIndex: 401,
       maxNativeZoom: 7,
       minNativeZoom: 0,
       maxZoom: 18,
+      fadeAnimation: false, // disable Leaflet's own per-tile fade to avoid double-flicker
+      keepBuffer: 4,        // keep a generous tile cache around the viewport
+      updateWhenIdle: false,
       attribution: "© RainViewer",
     });
     next.addTo(map);
     const old = radarLayerRef.current;
     radarLayerRef.current = next;
 
+    let rafId: number | null = null;
+    let fallbackId: any = null;
+    let started = false;
+
     const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
-    let rafId: number;
+
     const startFade = () => {
-      const t0 = performance.now();
+      if (started) return;
+      started = true;
+      if (fallbackId) clearTimeout(fallbackId);
       const oldStart = old ? (old.options.opacity ?? TARGET_OPACITY) : 0;
+      const t0 = performance.now();
       const tick = (now: number) => {
         const p = Math.min(1, (now - t0) / FADE_MS);
         const e = easeOutCubic(p);
@@ -306,21 +316,25 @@ export default function Regnradar() {
         } catch {}
         if (p < 1) {
           rafId = requestAnimationFrame(tick);
-        } else if (old) {
-          try { map.removeLayer(old); } catch {}
+        } else {
+          // Fully faded in — now safe to drop the old layer
+          if (old) {
+            try { map.removeLayer(old); } catch {}
+          }
         }
       };
       rafId = requestAnimationFrame(tick);
     };
-    // Wait for new tiles to paint before fading — fall back to short delay
-    let started = false;
-    const start = () => { if (!started) { started = true; startFade(); } };
-    next.on("load", start);
-    const fallback = setTimeout(start, 350);
+
+    // Leaflet fires "load" when every tile currently in the viewport has loaded.
+    next.on("load", startFade);
+    // Safety net: if "load" never fires (e.g. fully cached or off-screen tiles),
+    // start fading after a sensible delay anyway.
+    fallbackId = setTimeout(startFade, 800);
 
     return () => {
-      clearTimeout(fallback);
       if (rafId) cancelAnimationFrame(rafId);
+      if (fallbackId) clearTimeout(fallbackId);
     };
   }, [frames, currentIdx]);
 
@@ -674,40 +688,31 @@ export default function Regnradar() {
         )}
       </div>
 
-      {/* Controls + Timeline */}
-      <div
+      {/* Floating play/pause on the map (no full controls bar — graph handles scrubbing) */}
+      <button
+        data-testid="play-pause-btn"
+        aria-label={playing ? "Pausa" : "Spela"}
+        onClick={togglePlay}
         style={{
-          background: CARD,
-          borderTop: `1px solid ${BORDER}`,
-          padding: "10px 16px 8px",
+          position: "absolute",
+          right: 12,
+          bottom: graphOpen ? 224 : 96,
+          width: 44,
+          height: 44,
+          borderRadius: 22,
+          border: "none",
+          background: PRIMARY,
+          color: "#fff",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          boxShadow: "0 4px 14px rgba(37,99,235,0.45)",
+          zIndex: 500,
+          transition: "bottom 0.25s ease",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <IconButton
-            testID="prev-btn"
-            onClick={() => step(-1)}
-            ariaLabel="Föregående"
-          >
-            <Triangle dir="left" />
-          </IconButton>
-          <IconButton testID="play-pause-btn" onClick={togglePlay} primary ariaLabel={playing ? "Pausa" : "Spela"}>
-            {playing ? <Pause /> : <Play />}
-          </IconButton>
-          <IconButton testID="next-btn" onClick={() => step(1)} ariaLabel="Nästa">
-            <Triangle dir="right" />
-          </IconButton>
-          <div style={{ flex: 1, marginLeft: 6 }}>
-            <Timeline
-              frames={frames}
-              currentIdx={currentIdx}
-              onSeek={(i) => {
-                setPlaying(false);
-                setCurrentIdx(i);
-              }}
-            />
-          </div>
-        </div>
-      </div>
+        {playing ? <Pause /> : <Play />}
+      </button>
 
       {/* Rain graph (collapsible) */}
       <div
