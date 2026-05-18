@@ -103,6 +103,14 @@ export default function Regnradar() {
   const [pushPermission, setPushPermission] = useState<NotificationPermission>("default");
   const [showPushPrompt, setShowPushPrompt] = useState(false);
   const [installHint, setShowInstallHint] = useState(false);
+  const [notifToast, setNotifToast] = useState<string | null>(null);
+
+  // Auto-dismiss the notification toast after 2.5s
+  useEffect(() => {
+    if (!notifToast) return;
+    const id = setTimeout(() => setNotifToast(null), 2500);
+    return () => clearTimeout(id);
+  }, [notifToast]);
 
   // ─── Service worker registration & wait for Leaflet (loaded via CDN) ────────
   const [leafletReady, setLeafletReady] = useState(false);
@@ -572,20 +580,102 @@ export default function Regnradar() {
             )}
           </div>
         </div>
-        <div
+        <button
+          data-testid="notification-toggle-btn"
+          aria-label="Notisinställningar"
+          onClick={() => {
+            if (typeof window === "undefined" || !("Notification" in window)) {
+              setNotifToast("Notiser stöds inte i denna webbläsare");
+              return;
+            }
+            if (Notification.permission === "granted") {
+              setNotifToast("Notiser aktiva — du varnas innan regnet");
+            } else if (Notification.permission === "denied") {
+              setNotifToast("Notiser blockerade — aktivera i webbläsarinställningarna");
+            } else {
+              setShowPushPrompt(true);
+            }
+          }}
           style={{
             width: 42,
             height: 42,
             borderRadius: 12,
-            background: `${PRIMARY}15`,
+            background:
+              pushPermission === "granted"
+                ? `${PRIMARY}15`
+                : pushPermission === "denied"
+                ? "#F1F5F9"
+                : `${PRIMARY}15`,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
+            border: "none",
+            cursor: "pointer",
+            position: "relative",
           }}
         >
-          <CloudIcon color={PRIMARY} size={24} />
-        </div>
+          <BellIcon
+            color={
+              pushPermission === "denied" ? MUTED : PRIMARY
+            }
+            size={22}
+          />
+          {pushPermission === "granted" && (
+            <span
+              style={{
+                position: "absolute",
+                bottom: 4,
+                right: 4,
+                width: 10,
+                height: 10,
+                borderRadius: 5,
+                background: "#16A34A",
+                border: "2px solid #fff",
+              }}
+            />
+          )}
+          {pushPermission === "denied" && (
+            <span
+              style={{
+                position: "absolute",
+                top: 6,
+                right: 6,
+                fontSize: 9,
+                color: "#94A3B8",
+                fontWeight: 700,
+              }}
+            >
+              ✕
+            </span>
+          )}
+        </button>
       </div>
+
+      {/* Notification toast */}
+      {notifToast && (
+        <div
+          data-testid="notif-toast"
+          onClick={() => setNotifToast(null)}
+          style={{
+            position: "fixed",
+            top: "calc(env(safe-area-inset-top) + 70px)",
+            left: 16,
+            right: 16,
+            background: "rgba(15,23,42,0.92)",
+            color: "#fff",
+            padding: "10px 14px",
+            borderRadius: 12,
+            fontSize: 13,
+            fontWeight: 500,
+            textAlign: "center",
+            zIndex: 9000,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.2)",
+            animation: "slideDown 0.3s ease-out",
+          }}
+        >
+          {notifToast}
+        </div>
+      )}
 
       {/* Warning banner */}
       {warning && (
