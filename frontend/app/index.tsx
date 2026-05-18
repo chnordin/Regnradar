@@ -16,14 +16,22 @@ const BORDER = "#E2E8F0";
 const SAMPLE_ZOOM = 6; // zoom level used for intensity sampling
 
 // Rain Viewer color scheme 2 (universal blue) dBZ approximation by hue
+// Rain Viewer "Universal Blue" (scheme 2) → dBZ.
+// The palette is overwhelmingly blue: very light cyan = trace, medium blue =
+// 1-3 mm/h, dark navy = 10-20 mm/h, with yellow/red rarely present for very
+// extreme echoes. We calibrate primarily by HSV darkness within the blue band
+// and treat semi-transparent / near-white pixels as no rain.
 function rgbToDbz(r: number, g: number, b: number, a: number): number {
-  if (a < 20) return -10; // no echo
-  // Convert RGB to HSV
+  // Hard cutoffs for "no echo".
+  if (a < 40) return -10;
+
   const rn = r / 255,
     gn = g / 255,
     bn = b / 255;
   const max = Math.max(rn, gn, bn);
   const min = Math.min(rn, gn, bn);
+  const v = max; // HSV value
+  const s = max === 0 ? 0 : (max - min) / max; // saturation
   const d = max - min;
   let h = 0;
   if (d !== 0) {
@@ -33,17 +41,33 @@ function rgbToDbz(r: number, g: number, b: number, a: number): number {
     h *= 60;
     if (h < 0) h += 360;
   }
-  // Map hue to dBZ (approx for RainViewer scheme 2)
-  // cyan(180) light → blue(220) → green(120) → yellow(60) → orange(30) → red(0) → magenta(300)
-  if (max < 0.2) return -5;
-  if (h >= 170 && h < 200) return 5; // cyan
-  if (h >= 200 && h < 250) return 18; // blue
-  if (h >= 90 && h < 170) return 28; // green
-  if (h >= 40 && h < 70) return 38; // yellow
-  if (h >= 15 && h < 40) return 48; // orange
-  if (h < 15 || h >= 340) return 55; // red
-  if (h >= 280 && h < 340) return 62; // magenta/violet
-  return 10;
+
+  // Near-white / very desaturated pale pixel → treat as no rain.
+  if (v > 0.9 && s < 0.18) return -10;
+  // Semi-transparent pixel near the alpha cutoff → trace at most, count as zero.
+  if (a < 80 && s < 0.4) return -10;
+
+  // Blue family (h ~ 180-260) — the dominant Universal Blue palette.
+  if (h >= 170 && h < 260) {
+    // "darkness" combines low brightness with high saturation. The darker /
+    // more saturated the blue, the heavier the rain.
+    const darkness = (1 - v) * 0.7 + s * 0.3;
+    if (darkness < 0.10) return -10; // very light → no rain
+    if (darkness < 0.22) return 8;   // light blue   → ~0.15 mm/h
+    if (darkness < 0.38) return 20;  // medium-light → ~0.7 mm/h
+    if (darkness < 0.52) return 30;  // medium blue  → ~3 mm/h
+    if (darkness < 0.66) return 38;  // dark blue    → ~8 mm/h
+    if (darkness < 0.80) return 45;  // very dark    → ~20 mm/h
+    return 52;                        // navy/black   → ~40 mm/h
+  }
+
+  // Edge cases: brighter palette regions used in some schemes / extreme cells.
+  if (h >= 40 && h < 70) return 42;  // yellow  → ~15 mm/h
+  if (h >= 15 && h < 40) return 50;  // orange  → ~30 mm/h
+  if (h < 15 || h >= 340) return 55; // red     → ~50 mm/h
+  if (h >= 280 && h < 340) return 60; // magenta → ~70 mm/h
+
+  return -10;
 }
 
 function dbzToMmh(dbz: number): number {
@@ -487,20 +511,25 @@ export default function Regnradar() {
             if (!ctx) return resolve(null);
             ctx.clearRect(0, 0, 256, 256);
             ctx.drawImage(img, 0, 0);
-            // 3x3 average around the pixel for stability.
-            let sumMmh = 0;
-            let count = 0;
-            for (let dy = -1; dy <= 1; dy++) {
-              for (let dx = -1; dx <= 1; dx++) {
+            // Sample a 5×5 area for stability against single outlier pixels.
+            // Trimmed mean: drop the highest sample so a hot edge tile doesn't
+            // bias the average upward.
+            const mmhs: number[] = [];
+            for (let dy = -2; dy <= 2; dy++) {
+              for (let dx = -2; dx <= 2; dx++) {
                 const x = Math.max(0, Math.min(255, px + dx));
                 const y = Math.max(0, Math.min(255, py + dy));
                 const d = ctx.getImageData(x, y, 1, 1).data;
                 const dbz = rgbToDbz(d[0], d[1], d[2], d[3]);
-                sumMmh += dbzToMmh(dbz);
-                count++;
+                mmhs.push(dbzToMmh(dbz));
               }
             }
-            resolve(count ? sumMmh / count : 0);
+            if (!mmhs.length) return resolve(0);
+            mmhs.sort((a, b) => a - b);
+            // Drop the top sample, then average the remaining 24.
+            mmhs.pop();
+            const sum = mmhs.reduce((s, v) => s + v, 0);
+            resolve(sum / mmhs.length);
           } catch (e) {
             resolve(null);
           }
