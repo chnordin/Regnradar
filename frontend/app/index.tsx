@@ -95,6 +95,7 @@ export default function Regnradar() {
   const [currentIdx, setCurrentIdx] = useState(0);
   const [playing, setPlaying] = useState(true);
   const playTimerRef = useRef<any>(null);
+  const scrubResumeRef = useRef<number | null>(null);
 
   const [intensities, setIntensities] = useState<(number | null)[]>([]);
   const [graphOpen, setGraphOpen] = useState(true);
@@ -748,7 +749,28 @@ export default function Regnradar() {
         </button>
         {graphOpen && (
           <div data-testid="rain-graph" style={{ padding: "0 12px 12px" }}>
-            <RainGraph frames={frames} intensities={intensities} currentIdx={currentIdx} />
+            <RainGraph
+              frames={frames}
+              intensities={intensities}
+              currentIdx={currentIdx}
+              onScrub={(idx, isFinal) => {
+                if (scrubResumeRef.current) {
+                  clearTimeout(scrubResumeRef.current);
+                  scrubResumeRef.current = null;
+                }
+                if (!isFinal) {
+                  // Active scrubbing — pause and jump
+                  setPlaying(false);
+                  setCurrentIdx(idx);
+                } else {
+                  // Touch released — schedule resume after 3s of inactivity
+                  scrubResumeRef.current = setTimeout(() => {
+                    setPlaying(true);
+                    scrubResumeRef.current = null;
+                  }, 3000) as unknown as number;
+                }
+              }}
+            />
           </div>
         )}
       </div>
@@ -958,11 +980,61 @@ function RainGraph({
   frames,
   intensities,
   currentIdx,
+  onScrub,
 }: {
   frames: any[];
   intensities: (number | null)[];
   currentIdx: number;
+  onScrub?: (idx: number, isFinal: boolean) => void;
 }) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const scrubbingRef = useRef(false);
+  const tweenRafRef = useRef<number | null>(null);
+
+  // ── Animated displayed intensities ─────────────────────────────────────────
+  // Tween from the previous displayed values to the new `intensities` over 500ms.
+  const [displayed, setDisplayed] = useState<(number | null)[]>(intensities);
+  const fromRef = useRef<(number | null)[]>(intensities);
+  const targetRef = useRef<(number | null)[]>(intensities);
+
+  useEffect(() => {
+    // Update target. Start a new tween from current displayed values.
+    targetRef.current = intensities;
+    // If lengths differ, reset immediately (different frame count = different x-axis)
+    if (displayed.length !== intensities.length) {
+      fromRef.current = intensities;
+      setDisplayed(intensities);
+      return;
+    }
+    // Snapshot current displayed as the new "from"
+    fromRef.current = [...displayed];
+    if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+    const dur = 500;
+    const t0 = performance.now();
+    // ease-in-out cubic
+    const ease = (t: number) =>
+      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    const tick = (now: number) => {
+      const p = Math.min(1, (now - t0) / dur);
+      const e = ease(p);
+      const out: (number | null)[] = intensities.map((tgt, i) => {
+        const src = fromRef.current[i];
+        if (tgt == null && src == null) return null;
+        if (tgt == null) return src; // keep previous if new is null (still loading)
+        if (src == null) return tgt * e; // grow from 0 to target
+        return src + (tgt - src) * e;
+      });
+      setDisplayed(out);
+      if (p < 1) tweenRafRef.current = requestAnimationFrame(tick);
+      else tweenRafRef.current = null;
+    };
+    tweenRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intensities]);
+
   if (!frames.length) {
     return (
       <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", color: MUTED, fontSize: 12 }}>
@@ -981,7 +1053,7 @@ function RainGraph({
   const innerW = W - PAD_LEFT - PAD_RIGHT;
   const innerH = H - PAD_TOP - PAD_BOTTOM;
 
-  const maxMmh = Math.max(5.5, ...intensities.map((v) => v ?? 0));
+  const maxMmh = Math.max(5.5, ...displayed.map((v) => v ?? 0), ...intensities.map((v) => v ?? 0));
   const xFor = (i: number) =>
     PAD_LEFT + (frames.length === 1 ? innerW / 2 : (i / (frames.length - 1)) * innerW);
   const yFor = (v: number) => PAD_TOP + (1 - v / maxMmh) * innerH;
@@ -991,7 +1063,7 @@ function RainGraph({
   type P = { x: number; y: number; v: number };
   const points: P[] = [];
   for (let i = 0; i < frames.length; i++) {
-    const v = intensities[i];
+    const v = displayed[i];
     if (v == null) continue;
     points.push({ x: xFor(i), y: yFor(Math.max(0, v)), v });
   }
@@ -1037,7 +1109,7 @@ function RainGraph({
 
   // Current frame marker
   const curX = xFor(currentIdx);
-  const curV = intensities[currentIdx];
+  const curV = displayed[currentIdx];
   const curY = curV != null ? yFor(Math.max(0, curV)) : null;
 
   // X-axis labels
@@ -1052,13 +1124,71 @@ function RainGraph({
   const yPct = (v: number) => ((PAD_TOP + (1 - v / maxMmh) * innerH) / H) * 100;
   const xPct = (i: number) => (xFor(i) / W) * 100;
 
+  // ── Scrubbing: compute frame index from a touch/mouse X position ───────────
+  const indexFromClientX = (clientX: number): number => {
+    const svg = svgRef.current;
+    if (!svg) return currentIdx;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0) return currentIdx;
+    const localX = clientX - rect.left;
+    const xInVB = (localX / rect.width) * W;
+    const innerX = xInVB - PAD_LEFT;
+    const ratio = Math.max(0, Math.min(1, innerX / innerW));
+    return Math.round(ratio * Math.max(0, frames.length - 1));
+  };
+
+  const handleScrubStart = (clientX: number) => {
+    if (!onScrub) return;
+    scrubbingRef.current = true;
+    onScrub(indexFromClientX(clientX), false);
+  };
+  const handleScrubMove = (clientX: number) => {
+    if (!scrubbingRef.current || !onScrub) return;
+    onScrub(indexFromClientX(clientX), false);
+  };
+  const handleScrubEnd = () => {
+    if (!scrubbingRef.current || !onScrub) return;
+    scrubbingRef.current = false;
+    onScrub(currentIdx, true);
+  };
+
   return (
     <div style={{ position: "relative", width: "100%" }}>
       <svg
+        ref={svgRef}
         data-testid="rain-graph-svg"
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="none"
-        style={{ display: "block", width: "100%", height: 160 }}
+        style={{
+          display: "block",
+          width: "100%",
+          height: 160,
+          touchAction: "none",
+          userSelect: "none",
+          cursor: onScrub ? "ew-resize" : "default",
+        }}
+        onTouchStart={(e) => {
+          if (e.touches.length) handleScrubStart(e.touches[0].clientX);
+        }}
+        onTouchMove={(e) => {
+          if (e.touches.length) {
+            e.preventDefault();
+            handleScrubMove(e.touches[0].clientX);
+          }
+        }}
+        onTouchEnd={handleScrubEnd}
+        onTouchCancel={handleScrubEnd}
+        onMouseDown={(e) => {
+          (e.currentTarget as any).setPointerCapture?.((e as any).pointerId);
+          handleScrubStart(e.clientX);
+        }}
+        onMouseMove={(e) => {
+          if (scrubbingRef.current) handleScrubMove(e.clientX);
+        }}
+        onMouseUp={handleScrubEnd}
+        onMouseLeave={() => {
+          if (scrubbingRef.current) handleScrubEnd();
+        }}
       >
         <defs>
           <linearGradient id="rainFill" x1="0" y1="0" x2="0" y2="1">
