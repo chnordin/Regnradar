@@ -428,7 +428,7 @@ export default function Regnradar() {
     if (!playing || !frames.length) return;
     playTimerRef.current = setInterval(() => {
       setCurrentIdx((i) => (i + 1) % frames.length);
-    }, 600);
+    }, 400);
     return () => clearInterval(playTimerRef.current);
   }, [playing, frames.length]);
 
@@ -1213,6 +1213,141 @@ function RainGraph({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [combined]);
 
+  // Layout constants — drawn into an SVG with a fixed viewBox, stretched to width
+  const W = 1000;
+  const H = 160;
+  const PAD_LEFT = 56;
+  const PAD_RIGHT = 16;
+  const PAD_TOP = 10;
+  const PAD_BOTTOM = 22;
+  const innerW = W - PAD_LEFT - PAD_RIGHT;
+  const innerH = H - PAD_TOP - PAD_BOTTOM;
+
+  // ── Time-based X axis: -15min on the left, +2h on the right (now is offset) ──
+  const tMin = now - 15 * 60;
+  const tMax = now + 2 * 3600;
+  const xForTime = (t: number) =>
+    PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
+
+  // ── Current frame marker — positioned by the current radar frame's time ────
+  // We tween between consecutive `curX` targets so the marker visually slides
+  // smoothly between frames instead of snapping each animation tick. Hooks
+  // MUST come before any conditional early return below (React rules).
+  const targetCurX = xForTime(frames[currentIdx]?.time ?? tMin);
+  const [animCurX, setAnimCurX] = useState(targetCurX);
+  const animCurXRef = useRef(targetCurX);
+  const markerRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (markerRafRef.current) cancelAnimationFrame(markerRafRef.current);
+    // During active scrub: snap immediately for responsive feedback.
+    if (scrubbingRef.current) {
+      animCurXRef.current = targetCurX;
+      setAnimCurX(targetCurX);
+      return;
+    }
+    const start = animCurXRef.current;
+    const target = targetCurX;
+    if (!isFinite(target) || Math.abs(start - target) < 0.5) {
+      animCurXRef.current = target;
+      setAnimCurX(target);
+      return;
+    }
+    const t0 = performance.now();
+    const dur = 280;
+    const ease = (t: number) => 1 - Math.pow(1 - t, 3);
+    const tick = (now: number) => {
+      const p = Math.min(1, (now - t0) / dur);
+      const v = start + (target - start) * ease(p);
+      animCurXRef.current = v;
+      setAnimCurX(v);
+      if (p < 1) markerRafRef.current = requestAnimationFrame(tick);
+      else markerRafRef.current = null;
+    };
+    markerRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (markerRafRef.current) cancelAnimationFrame(markerRafRef.current);
+    };
+  }, [targetCurX]);
+
+  // ── Scrubbing handlers — defined before the empty-state early return so
+  // that the `useRef` and `useEffect` hooks below honor the rules-of-hooks. ──
+  const indexFromClientX = (clientX: number): number => {
+    const svg = svgRef.current;
+    if (!svg || !frames.length) return currentIdx;
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0) return currentIdx;
+    const localX = clientX - rect.left;
+    const xInVB = (localX / rect.width) * W;
+    const innerX = Math.max(0, Math.min(innerW, xInVB - PAD_LEFT));
+    const ratio = innerX / innerW;
+    const targetT = tMin + ratio * (tMax - tMin);
+    let bestIdx = 0;
+    let bestDt = Infinity;
+    for (let i = 0; i < frames.length; i++) {
+      const dt = Math.abs(frames[i].time - targetT);
+      if (dt < bestDt) {
+        bestDt = dt;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  };
+  const handleScrubStart = (clientX: number) => {
+    if (!onScrub) return;
+    scrubbingRef.current = true;
+    onScrub(indexFromClientX(clientX), false);
+  };
+  const handleScrubMove = (clientX: number) => {
+    if (!scrubbingRef.current || !onScrub) return;
+    onScrub(indexFromClientX(clientX), false);
+  };
+  const handleScrubEnd = () => {
+    if (!scrubbingRef.current || !onScrub) return;
+    scrubbingRef.current = false;
+    onScrub(currentIdx, true);
+  };
+  // Native non-passive touch listeners for iOS Safari. React's synthetic touch
+  // handlers are passive by default in modern React → preventDefault() is a
+  // no-op on iOS, breaking scrub. We attach native listeners with
+  // `{ passive: false }` so preventDefault works and scrub gestures are
+  // captured correctly on mobile.
+  const scrubFnsRef = useRef({
+    start: handleScrubStart,
+    move: handleScrubMove,
+    end: handleScrubEnd,
+  });
+  scrubFnsRef.current = {
+    start: handleScrubStart,
+    move: handleScrubMove,
+    end: handleScrubEnd,
+  };
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onStart = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+      if (e.touches.length) scrubFnsRef.current.start(e.touches[0].clientX);
+    };
+    const onMove = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+      if (e.touches.length) scrubFnsRef.current.move(e.touches[0].clientX);
+    };
+    const onEnd = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+      scrubFnsRef.current.end();
+    };
+    svg.addEventListener("touchstart", onStart, { passive: false });
+    svg.addEventListener("touchmove", onMove, { passive: false });
+    svg.addEventListener("touchend", onEnd, { passive: false });
+    svg.addEventListener("touchcancel", onEnd, { passive: false });
+    return () => {
+      svg.removeEventListener("touchstart", onStart);
+      svg.removeEventListener("touchmove", onMove);
+      svg.removeEventListener("touchend", onEnd);
+      svg.removeEventListener("touchcancel", onEnd);
+    };
+  }, []);
+
   // Empty state: only block rendering when we have nothing at all to show.
   // Once either radar intensities OR Open-Meteo precip is in, we render with
   // whatever is available — radar-only is a perfectly valid graph.
@@ -1240,22 +1375,6 @@ function RainGraph({
       </div>
     );
   }
-
-  // Layout constants — drawn into an SVG with a fixed viewBox, stretched to width
-  const W = 1000;
-  const H = 160;
-  const PAD_LEFT = 56;
-  const PAD_RIGHT = 16;
-  const PAD_TOP = 10;
-  const PAD_BOTTOM = 22;
-  const innerW = W - PAD_LEFT - PAD_RIGHT;
-  const innerH = H - PAD_TOP - PAD_BOTTOM;
-
-  // ── Time-based X axis: -15min on the left, +2h on the right (now is offset) ──
-  const tMin = now - 15 * 60;
-  const tMax = now + 2 * 3600;
-  const xForTime = (t: number) =>
-    PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
 
   // ── Dynamic Y scale: peak * 1.25 with floor of 2.5 mm/h so the default
   //    "Duggregn / Lätt regn / Måttligt" band is visible when there's no rain,
@@ -1316,9 +1435,9 @@ function RainGraph({
   // Forecast boundary = wall-clock NOW (not the radar nowcast frame boundary).
   const nowcastX = xForTime(now);
 
-  // ── Current frame marker — positioned by the current radar frame's time ────
-  const curT = frames[currentIdx]?.time ?? tMin;
-  const curX = xForTime(curT);
+  // Marker X is the animated value computed above (tween hook lives before the
+  // empty-state early return to satisfy React's rules-of-hooks).
+  const curX = animCurX;
   // Interpolate the curve's Y at the marker's X for a nice circle on the path
   let curY: number | null = null;
   if (points.length >= 2) {
@@ -1355,48 +1474,6 @@ function RainGraph({
   const yPct = (v: number) => ((PAD_TOP + (1 - v / maxMmh) * innerH) / H) * 100;
   const xPctTime = (t: number) => (xForTime(t) / W) * 100;
 
-  // ── Scrubbing: map a touch/mouse X position to a TIME within the visible
-  //    window, then snap to the frame whose timestamp is closest. This keeps
-  //    scrubbing responsive even when frames are clustered in a small part of
-  //    the chart (e.g. only 15 min of past + 30 min of nowcast).
-  const indexFromClientX = (clientX: number): number => {
-    const svg = svgRef.current;
-    if (!svg || !frames.length) return currentIdx;
-    const rect = svg.getBoundingClientRect();
-    if (rect.width <= 0) return currentIdx;
-    const localX = clientX - rect.left;
-    const xInVB = (localX / rect.width) * W;
-    const innerX = Math.max(0, Math.min(innerW, xInVB - PAD_LEFT));
-    const ratio = innerX / innerW;
-    const targetT = tMin + ratio * (tMax - tMin);
-    // Find frame with timestamp closest to targetT
-    let bestIdx = 0;
-    let bestDt = Infinity;
-    for (let i = 0; i < frames.length; i++) {
-      const dt = Math.abs(frames[i].time - targetT);
-      if (dt < bestDt) {
-        bestDt = dt;
-        bestIdx = i;
-      }
-    }
-    return bestIdx;
-  };
-
-  const handleScrubStart = (clientX: number) => {
-    if (!onScrub) return;
-    scrubbingRef.current = true;
-    onScrub(indexFromClientX(clientX), false);
-  };
-  const handleScrubMove = (clientX: number) => {
-    if (!scrubbingRef.current || !onScrub) return;
-    onScrub(indexFromClientX(clientX), false);
-  };
-  const handleScrubEnd = () => {
-    if (!scrubbingRef.current || !onScrub) return;
-    scrubbingRef.current = false;
-    onScrub(currentIdx, true);
-  };
-
   return (
     <div
       style={{
@@ -1424,22 +1501,6 @@ function RainGraph({
           WebkitTouchCallout: "none",
           WebkitTapHighlightColor: "transparent",
           cursor: onScrub ? "ew-resize" : "default",
-        }}
-        onTouchStart={(e) => {
-          if (e.cancelable) e.preventDefault();
-          if (e.touches.length) handleScrubStart(e.touches[0].clientX);
-        }}
-        onTouchMove={(e) => {
-          if (e.cancelable) e.preventDefault();
-          if (e.touches.length) handleScrubMove(e.touches[0].clientX);
-        }}
-        onTouchEnd={(e) => {
-          if (e.cancelable) e.preventDefault();
-          handleScrubEnd();
-        }}
-        onTouchCancel={(e) => {
-          if (e.cancelable) e.preventDefault();
-          handleScrubEnd();
         }}
         onMouseDown={(e) => {
           handleScrubStart(e.clientX);
