@@ -1236,38 +1236,49 @@ function RainGraph({
   const targetCurX = xForTime(frames[currentIdx]?.time ?? tMin);
   const [animCurX, setAnimCurX] = useState(targetCurX);
   const animCurXRef = useRef(targetCurX);
-  const markerRafRef = useRef<number | null>(null);
+  const targetCurXRef = useRef(targetCurX);
+  // Keep the latest target in a ref so the persistent RAF loop below always
+  // reads the fresh value without needing to re-mount.
+  targetCurXRef.current = targetCurX;
+  // ── Persistent RAF loop that drives the marker position independently of
+  //    React effect dependencies. Each frame we read the latest target from
+  //    `targetCurXRef` (updated on every render via `currentIdx`) and lerp the
+  //    animated value toward it. This guarantees the marker keeps moving on
+  //    iOS Safari even if React's reconciliation is throttled or batched.
   useEffect(() => {
-    if (markerRafRef.current) cancelAnimationFrame(markerRafRef.current);
-    // During active scrub: snap immediately for responsive feedback.
-    if (scrubbingRef.current) {
-      animCurXRef.current = targetCurX;
-      setAnimCurX(targetCurX);
-      return;
-    }
-    const start = animCurXRef.current;
-    const target = targetCurX;
-    if (!isFinite(target) || Math.abs(start - target) < 0.5) {
-      animCurXRef.current = target;
-      setAnimCurX(target);
-      return;
-    }
-    const t0 = performance.now();
-    const dur = 280;
-    const ease = (t: number) => 1 - Math.pow(1 - t, 3);
-    const tick = (now: number) => {
-      const p = Math.min(1, (now - t0) / dur);
-      const v = start + (target - start) * ease(p);
-      animCurXRef.current = v;
-      setAnimCurX(v);
-      if (p < 1) markerRafRef.current = requestAnimationFrame(tick);
-      else markerRafRef.current = null;
+    let raf: number | null = null;
+    const tick = () => {
+      const target = targetCurXRef.current;
+      const cur = animCurXRef.current;
+      if (!isFinite(target)) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      if (scrubbingRef.current) {
+        // Snap during scrub for responsive feedback
+        if (cur !== target) {
+          animCurXRef.current = target;
+          setAnimCurX(target);
+        }
+      } else {
+        const delta = target - cur;
+        if (Math.abs(delta) > 0.4) {
+          // Exponential ease-out per frame (≈ 18% closer each tick @ 60fps).
+          const next = cur + delta * 0.18;
+          animCurXRef.current = next;
+          setAnimCurX(next);
+        } else if (cur !== target) {
+          animCurXRef.current = target;
+          setAnimCurX(target);
+        }
+      }
+      raf = requestAnimationFrame(tick);
     };
-    markerRafRef.current = requestAnimationFrame(tick);
+    raf = requestAnimationFrame(tick);
     return () => {
-      if (markerRafRef.current) cancelAnimationFrame(markerRafRef.current);
+      if (raf !== null) cancelAnimationFrame(raf);
     };
-  }, [targetCurX]);
+  }, []);
 
   // ── Scrubbing handlers — defined before the empty-state early return so
   // that the `useRef` and `useEffect` hooks below honor the rules-of-hooks. ──
@@ -1675,15 +1686,19 @@ function RainGraph({
             </div>
           );
         })}
-        {/* X-axis time labels — hourly across the now ± 2h window */}
+        {/* X-axis time labels — every 15 min so the past-15-min portion
+            always has at least one label (now-15min), spanning the ±2h-ish
+            visible window from `tMin = now - 15min` to `tMax = now + 2h`. */}
         {(() => {
           const out: any[] = [];
-          // Round the first hour mark down from tMin
-          const firstHour = Math.floor(tMin / 3600) * 3600;
-          for (let t = firstHour; t <= tMax + 60; t += 1800) {
+          // Round down to the nearest 15-min mark below tMin
+          const firstTick = Math.floor(tMin / 900) * 900;
+          for (let t = firstTick; t <= tMax + 60; t += 900) {
             if (t < tMin) continue;
             const isOnHour = t % 3600 === 0;
-            const isNow = Math.abs(t - now) < 900; // within 15 min of now
+            const isOnHalfHour = !isOnHour && t % 1800 === 0;
+            const isOnQuarter = !isOnHour && !isOnHalfHour; // 15- or 45-min mark
+            const isNow = Math.abs(t - now) < 450; // within 7.5 min of now
             out.push(
               <div
                 key={"xt_" + t}
@@ -1692,11 +1707,11 @@ function RainGraph({
                   left: `${(xForTime(t) / W) * 100}%`,
                   transform: "translateX(-50%)",
                   bottom: 0,
-                  fontSize: isOnHour ? 11 : 10,
+                  fontSize: isOnHour ? 11 : isOnHalfHour ? 10 : 9,
                   color: isNow ? PRIMARY : MUTED,
                   fontWeight: isNow ? 700 : isOnHour ? 600 : 400,
                   whiteSpace: "nowrap",
-                  opacity: isOnHour ? 1 : 0.7,
+                  opacity: isOnHour ? 1 : isOnHalfHour ? 0.75 : 0.5,
                 }}
               >
                 {formatTime(t)}
