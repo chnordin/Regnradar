@@ -14,24 +14,6 @@ const BG = "#F8FAFC";
 const CARD = "#FFFFFF";
 const BORDER = "#E2E8F0";
 
-// ─── Graph layout constants (module-level so DOM-based marker manipulation
-//     outside RainGraph can compute positions consistently). ─────────────────
-const G_W = 1000;
-const G_H = 160;
-const G_PAD_LEFT = 56;
-const G_PAD_RIGHT = 16;
-const G_PAD_TOP = 10;
-const G_PAD_BOTTOM = 22;
-const G_INNER_W = G_W - G_PAD_LEFT - G_PAD_RIGHT;
-const G_INNER_H = G_H - G_PAD_TOP - G_PAD_BOTTOM;
-const G_BASELINE_Y = G_PAD_TOP + G_INNER_H;
-function graphXForTime(t: number): number {
-  const now = Date.now() / 1000;
-  const tMin = now - 15 * 60;
-  const tMax = now + 2 * 3600;
-  return G_PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * G_INNER_W;
-}
-
 // (Removed: radar pixel-sampling helpers — Open-Meteo is now the only
 // precipitation data source for both past and forecast.)
 function _unused_rgbToDbz(r: number, g: number, b: number, a: number): number {
@@ -137,37 +119,31 @@ export default function Regnradar() {
   // "now" on the initial load — subsequent refreshes preserve the running
   // animation index so the loop never resets mid-cycle.
   const firstFetchRef = useRef(true);
-  // ─── Marker DOM refs (graph) ───────────────────────────────────────────────
-  // The graph's current-frame marker is updated by direct DOM manipulation
-  // on every animation tick (no React state, no RAF, no tween). The refs are
-  // assigned by RainGraph via the `markerLineRef` / `markerCircleGroupRef`
-  // props and used here inside the setInterval below.
-  const markerLineRef = useRef<SVGLineElement | null>(null);
-  const markerCircleGroupRef = useRef<SVGGElement | null>(null);
-  const framesRef = useRef<typeof frames>([]);
-  framesRef.current = frames;
-  const setMarkerToIdx = (idx: number) => {
-    const f = framesRef.current[idx];
-    if (!f) return;
-    const x = graphXForTime(f.time);
-    if (!isFinite(x)) return;
-    if (markerLineRef.current) {
-      markerLineRef.current.setAttribute("x1", String(x));
-      markerLineRef.current.setAttribute("x2", String(x));
-    }
-    if (markerCircleGroupRef.current) {
-      markerCircleGroupRef.current.setAttribute(
-        "transform",
-        `translate(${x}, ${G_BASELINE_Y})`
-      );
-    }
-  };
 
-  const [intensities] = useState<(number | null)[]>([]);
-  // Note: kept as empty array shim — Open-Meteo `precip` is the sole source.
+  // ─── Derive per-frame intensities from Open-Meteo precip ───────────────────
+  // For each radar frame, look up the nearest Open-Meteo `minutely_15`
+  // precipitation slot and use that value. This drives the bar heights and
+  // the `currentMmh` readout.
+  // (Defined further below, after `precip` state — moved there to satisfy
+  //  the temporal-dead-zone rules.)
   // Open-Meteo 15-min precipitation forecast — authoritative intensity source
   const [precip, setPrecip] = useState<{ time: number; mmh: number }[]>([]);
   const [precipError, setPrecipError] = useState<string | null>(null);
+  const intensities = useMemo<(number | null)[]>(() => {
+    if (!precip.length) return frames.map(() => null);
+    return frames.map((f) => {
+      let bestDt = Infinity;
+      let bestMmh: number | null = null;
+      for (const p of precip) {
+        const dt = Math.abs(p.time - f.time);
+        if (dt < bestDt) {
+          bestDt = dt;
+          bestMmh = p.mmh;
+        }
+      }
+      return bestMmh;
+    });
+  }, [frames, precip]);
   const [graphOpen, setGraphOpen] = useState(true);
   const [warning, setWarning] = useState<{ minutes: number; mmh: number } | null>(null);
   const [pushPermission, setPushPermission] = useState<NotificationPermission>("default");
@@ -470,13 +446,7 @@ export default function Regnradar() {
   useEffect(() => {
     if (!playing || !frames.length) return;
     playTimerRef.current = setInterval(() => {
-      setCurrentIdx((i) => {
-        const newIdx = (i + 1) % framesRef.current.length;
-        // Update the graph marker via direct DOM manipulation. No RAF, no
-        // tween, no React state for the marker — just setAttribute.
-        setMarkerToIdx(newIdx);
-        return newIdx;
-      });
+      setCurrentIdx((i) => (i + 1) % frames.length);
     }, 400);
     return () => clearInterval(playTimerRef.current);
   }, [playing, frames.length]);
@@ -601,25 +571,18 @@ export default function Regnradar() {
     return () => clearInterval(id);
   }, []);
   const currentMmh = useMemo(() => {
-    const frame = frames[currentIdx];
-    // Open-Meteo is the ONLY source — pick the precip slot closest to the
-    // current frame's time, or to wall-clock NOW if no frame is ready yet.
-    if (!precip.length) return 0;
-    const targetT = frame ? frame.time : Date.now() / 1000;
-    let pick: { time: number; mmh: number } | null = null;
-    for (const p of precip) {
-      if (p.time <= targetT && (!pick || p.time > pick.time)) pick = p;
+    // intensities is already aligned with frames; just read the current slot.
+    const v = intensities[currentIdx];
+    if (v != null) return v;
+    // Fallback: nearest non-null intensity, then 0.
+    for (let i = currentIdx; i >= 0; i--) {
+      if (intensities[i] != null) return intensities[i] as number;
     }
-    if (!pick) {
-      let bestDt = Infinity;
-      for (const p of precip) {
-        const dt = Math.abs(p.time - targetT);
-        if (dt < bestDt) { bestDt = dt; pick = p; }
-      }
+    for (let i = currentIdx; i < intensities.length; i++) {
+      if (intensities[i] != null) return intensities[i] as number;
     }
-    return pick ? pick.mmh : 0;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frames, currentIdx, precip]);
+    return 0;
+  }, [intensities, currentIdx]);
 
   // Tween the displayed mm/h value smoothly when target changes
   const [displayedMmh, setDisplayedMmh] = useState(0);
@@ -969,25 +932,6 @@ export default function Regnradar() {
               precip={precip}
               precipError={precipError}
               currentIdx={currentIdx}
-              markerLineRef={markerLineRef}
-              markerCircleGroupRef={markerCircleGroupRef}
-              onScrub={(idx, isFinal) => {
-                if (scrubResumeRef.current) {
-                  clearTimeout(scrubResumeRef.current);
-                  scrubResumeRef.current = null;
-                }
-                if (!isFinal) {
-                  setPlaying(false);
-                  setCurrentIdx(idx);
-                  setMarkerToIdx(idx);
-                } else {
-                  setMarkerToIdx(idx);
-                  scrubResumeRef.current = setTimeout(() => {
-                    setPlaying(true);
-                    scrubResumeRef.current = null;
-                  }, 3000) as unknown as number;
-                }
-              }}
             />
           </div>
         )}
@@ -1200,184 +1144,26 @@ function RainGraph({
   precip,
   precipError,
   currentIdx,
-  onScrub,
-  markerLineRef,
-  markerCircleGroupRef,
 }: {
   frames: any[];
   intensities: (number | null)[];
   precip: { time: number; mmh: number }[];
   precipError?: string | null;
   currentIdx: number;
-  onScrub?: (idx: number, isFinal: boolean) => void;
-  markerLineRef?: React.MutableRefObject<SVGLineElement | null>;
-  markerCircleGroupRef?: React.MutableRefObject<SVGGElement | null>;
 }) {
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const scrubbingRef = useRef(false);
-  const tweenRafRef = useRef<number | null>(null);
-
-  // ── Build the combined source-of-truth data points ─────────────────────────
-  // Open-Meteo is the sole source. It returns minutely_15 precipitation across
-  // a ±3h window (past_hours=3 + forecast_hours=3). We render every entry that
-  // falls within our visible ±2h-around-now window.
+  // 30-second tick so the wall-clock-relative "PROGNOS" boundary and the
+  // bar/now alignment drift smoothly with time.
   const [, setTick] = useState(0);
   useEffect(() => {
-    // Re-render every 30s so the wall-clock-relative X-axis advances smoothly.
     const id = setInterval(() => setTick((t) => t + 1), 30_000);
     return () => clearInterval(id);
   }, []);
-  const now = Date.now() / 1000;
-  const combined: { time: number; mmh: number }[] = useMemo(() => {
-    return [...precip].sort((a, b) => a.time - b.time);
-  }, [precip]);
 
-  // ── Animated displayed values, keyed by time ───────────────────────────────
-  const [displayed, setDisplayed] = useState<{ time: number; mmh: number }[]>(combined);
-  const fromRef = useRef<{ time: number; mmh: number }[]>(combined);
-
-  useEffect(() => {
-    const sameLen = displayed.length === combined.length;
-    const sameKeys =
-      sameLen && displayed.every((d, i) => d.time === combined[i].time);
-    if (!sameKeys) {
-      fromRef.current = combined;
-      setDisplayed(combined);
-      return;
-    }
-    fromRef.current = displayed.map((d) => ({ ...d }));
-    if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
-    const dur = 500;
-    const t0 = performance.now();
-    const ease = (t: number) =>
-      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-    const tick = (now: number) => {
-      const p = Math.min(1, (now - t0) / dur);
-      const e = ease(p);
-      const out = combined.map((tgt, i) => {
-        const src = fromRef.current[i];
-        if (!src) return tgt;
-        return { time: tgt.time, mmh: src.mmh + (tgt.mmh - src.mmh) * e };
-      });
-      setDisplayed(out);
-      if (p < 1) tweenRafRef.current = requestAnimationFrame(tick);
-      else tweenRafRef.current = null;
-    };
-    tweenRafRef.current = requestAnimationFrame(tick);
-    return () => {
-      if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [combined]);
-
-  // Layout constants — drawn into an SVG with a fixed viewBox, stretched to width
-  const W = 1000;
-  const H = 160;
-  const PAD_LEFT = 56;
-  const PAD_RIGHT = 16;
-  const PAD_TOP = 10;
-  const PAD_BOTTOM = 22;
-  const innerW = W - PAD_LEFT - PAD_RIGHT;
-  const innerH = H - PAD_TOP - PAD_BOTTOM;
-
-  // ── Time-based X axis: -15min on the left, +2h on the right (now is offset) ──
-  const tMin = now - 15 * 60;
-  const tMax = now + 2 * 3600;
-  const xForTime = (t: number) =>
-    PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
-
-  // ── Current frame marker is updated by direct DOM manipulation from the
-  //    parent's animation setInterval (no React state, no RAF, no tween).
-  //    The refs are attached to the <line> and <g> elements in JSX below. ──
-
-  // ── Scrubbing handlers — defined before the empty-state early return so
-  // that the `useRef` and `useEffect` hooks below honor the rules-of-hooks. ──
-  const indexFromClientX = (clientX: number): number => {
-    const svg = svgRef.current;
-    if (!svg || !frames.length) return currentIdx;
-    const rect = svg.getBoundingClientRect();
-    if (rect.width <= 0) return currentIdx;
-    const localX = clientX - rect.left;
-    const xInVB = (localX / rect.width) * W;
-    const innerX = Math.max(0, Math.min(innerW, xInVB - PAD_LEFT));
-    const ratio = innerX / innerW;
-    const targetT = tMin + ratio * (tMax - tMin);
-    let bestIdx = 0;
-    let bestDt = Infinity;
-    for (let i = 0; i < frames.length; i++) {
-      const dt = Math.abs(frames[i].time - targetT);
-      if (dt < bestDt) {
-        bestDt = dt;
-        bestIdx = i;
-      }
-    }
-    return bestIdx;
-  };
-  const handleScrubStart = (clientX: number) => {
-    if (!onScrub) return;
-    scrubbingRef.current = true;
-    onScrub(indexFromClientX(clientX), false);
-  };
-  const handleScrubMove = (clientX: number) => {
-    if (!scrubbingRef.current || !onScrub) return;
-    onScrub(indexFromClientX(clientX), false);
-  };
-  const handleScrubEnd = () => {
-    if (!scrubbingRef.current || !onScrub) return;
-    scrubbingRef.current = false;
-    onScrub(currentIdx, true);
-  };
-  // Native non-passive touch listeners for iOS Safari. React's synthetic touch
-  // handlers are passive by default in modern React → preventDefault() is a
-  // no-op on iOS, breaking scrub. We attach native listeners with
-  // `{ passive: false }` so preventDefault works and scrub gestures are
-  // captured correctly on mobile.
-  const scrubFnsRef = useRef({
-    start: handleScrubStart,
-    move: handleScrubMove,
-    end: handleScrubEnd,
-  });
-  scrubFnsRef.current = {
-    start: handleScrubStart,
-    move: handleScrubMove,
-    end: handleScrubEnd,
-  };
-  useEffect(() => {
-    const svg = svgRef.current;
-    if (!svg) return;
-    const onStart = (e: TouchEvent) => {
-      if (e.cancelable) e.preventDefault();
-      if (e.touches.length) scrubFnsRef.current.start(e.touches[0].clientX);
-    };
-    const onMove = (e: TouchEvent) => {
-      if (e.cancelable) e.preventDefault();
-      if (e.touches.length) scrubFnsRef.current.move(e.touches[0].clientX);
-    };
-    const onEnd = (e: TouchEvent) => {
-      if (e.cancelable) e.preventDefault();
-      scrubFnsRef.current.end();
-    };
-    svg.addEventListener("touchstart", onStart, { passive: false });
-    svg.addEventListener("touchmove", onMove, { passive: false });
-    svg.addEventListener("touchend", onEnd, { passive: false });
-    svg.addEventListener("touchcancel", onEnd, { passive: false });
-    return () => {
-      svg.removeEventListener("touchstart", onStart);
-      svg.removeEventListener("touchmove", onMove);
-      svg.removeEventListener("touchend", onEnd);
-      svg.removeEventListener("touchcancel", onEnd);
-    };
-  }, []);
-
-  // Empty state: only block rendering when we have nothing at all to show.
-  // Once either radar intensities OR Open-Meteo precip is in, we render with
-  // whatever is available — radar-only is a perfectly valid graph.
-  const hasAnyData = combined.length > 0;
-  if (!hasAnyData) {
+  if (!frames.length) {
     return (
       <div
         style={{
-          height: 160,
+          height: 132,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
@@ -1398,74 +1184,18 @@ function RainGraph({
   }
 
   // ── Dynamic Y scale: peak * 1.25 with floor of 2.5 mm/h so the default
-  //    "Duggregn / Lätt regn / Måttligt" band is visible when there's no rain,
-  //    and stronger peaks scale up naturally with headroom above. ──
+  //    "Duggregn / Lätt regn / Måttligt" band is visible when there's no rain.
   const peak = Math.max(
     0,
-    ...displayed.map((p) => p.mmh),
-    ...combined.map((p) => p.mmh)
+    ...intensities.map((v) => v ?? 0)
   );
   const maxMmh = Math.max(2.5, peak * 1.25);
-  const yFor = (v: number) => PAD_TOP + (1 - v / maxMmh) * innerH;
-
-  // Build smooth path through points (sorted, clipped to extended range)
-  type P = { x: number; y: number };
-  const points: P[] = displayed
-    .filter((p) => p.time >= tMin - 600 && p.time <= tMax + 600)
-    .sort((a, b) => a.time - b.time)
-    .map((p) => ({ x: xForTime(p.time), y: yFor(Math.max(0, p.mmh)) }));
-
-  // Cardinal spline path (smooth) — tension 0.5, with Y-clamping safety
-  function buildPath(pts: P[], close: boolean) {
-    if (pts.length === 0) return "";
-    if (pts.length === 1) {
-      const p = pts[0];
-      return close
-        ? `M ${p.x} ${yFor(0)} L ${p.x} ${p.y} L ${p.x} ${yFor(0)} Z`
-        : `M ${p.x} ${p.y}`;
-    }
-    let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
-    const baseY = yFor(0);
-    const topY = PAD_TOP;
-    const clampY = (y: number) => Math.max(topY, Math.min(baseY, y));
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = pts[i - 1] || pts[i];
-      const p1 = pts[i];
-      const p2 = pts[i + 1];
-      const p3 = pts[i + 2] || p2;
-      const t = 0.5;
-      const cp1x = p1.x + ((p2.x - p0.x) / 6) * t * 2;
-      let cp1y = p1.y + ((p2.y - p0.y) / 6) * t * 2;
-      const cp2x = p2.x - ((p3.x - p1.x) / 6) * t * 2;
-      let cp2y = p2.y - ((p3.y - p1.y) / 6) * t * 2;
-      cp1y = clampY(cp1y);
-      cp2y = clampY(cp2y);
-      d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
-    }
-    if (close) {
-      const last = pts[pts.length - 1];
-      const first = pts[0];
-      d += ` L ${last.x.toFixed(2)} ${baseY.toFixed(2)} L ${first.x.toFixed(2)} ${baseY.toFixed(2)} Z`;
-    }
-    return d;
-  }
-
-  const linePath = buildPath(points, false);
-  const fillPath = buildPath(points, true);
-
-  // Forecast boundary = wall-clock NOW (not the radar nowcast frame boundary).
-  const nowcastX = xForTime(now);
-
-  // Initial marker X: directly from the current frame's timestamp. After
-  // mount, the parent's animation setInterval drives all subsequent updates
-  // via setAttribute on the refs below.
-  const initialMarkerX = xForTime(frames[currentIdx]?.time ?? tMin);
-
-  // X-axis labels — pick a few evenly spaced frame times for context
+  const graphH = 120;
+  const yFor = (v: number) => (1 - v / maxMmh) * graphH;
   const labelEvery = Math.max(1, Math.floor(frames.length / 6));
 
   // Intensity reference lines (mm/h). Shown only when they fit within the
-  // current Y range (maxMmh). Ordered descending so we filter by `value <= maxMmh`.
+  // current Y range.
   const allRefs = [
     { label: "Skyfall", value: 30 },
     { label: "Kraftigt", value: 10 },
@@ -1475,261 +1205,115 @@ function RainGraph({
   ];
   const refs = allRefs.filter((r) => r.value <= maxMmh);
 
-  const yPct = (v: number) => ((PAD_TOP + (1 - v / maxMmh) * innerH) / H) * 100;
-  const xPctTime = (t: number) => (xForTime(t) / W) * 100;
-
   return (
-    <div
-      style={{
-        position: "relative",
-        width: "100%",
-        overflow: "hidden",
-        userSelect: "none",
-        WebkitUserSelect: "none",
-        WebkitTouchCallout: "none",
-        WebkitTapHighlightColor: "transparent",
-      }}
-    >
-      <svg
-        ref={svgRef}
-        data-testid="rain-graph-svg"
-        viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="none"
+    <div style={{ position: "relative" }}>
+      <div
         style={{
-          display: "block",
-          width: "100%",
-          height: 160,
-          touchAction: "none",
-          userSelect: "none",
-          WebkitUserSelect: "none",
-          WebkitTouchCallout: "none",
-          WebkitTapHighlightColor: "transparent",
-          cursor: onScrub ? "ew-resize" : "default",
-        }}
-        onMouseDown={(e) => {
-          handleScrubStart(e.clientX);
-        }}
-        onMouseMove={(e) => {
-          if (scrubbingRef.current) handleScrubMove(e.clientX);
-        }}
-        onMouseUp={handleScrubEnd}
-        onMouseLeave={() => {
-          if (scrubbingRef.current) handleScrubEnd();
+          position: "relative",
+          height: graphH,
+          display: "flex",
+          alignItems: "flex-end",
+          gap: 3,
+          paddingLeft: 70,
+          paddingRight: 4,
+          background: "linear-gradient(180deg, #F8FAFC 0%, #fff 100%)",
+          borderRadius: 8,
+          borderBottom: `1px solid ${BORDER}`,
         }}
       >
-        <defs>
-          <linearGradient id="rainFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={PRIMARY} stopOpacity="0.85" />
-            <stop offset="55%" stopColor={PRIMARY} stopOpacity="0.35" />
-            <stop offset="100%" stopColor={PRIMARY} stopOpacity="0.02" />
-          </linearGradient>
-          {/* Clip everything that should never render below the baseline or above the ceiling */}
-          <clipPath id="graphClip">
-            <rect
-              x={PAD_LEFT}
-              y={PAD_TOP}
-              width={W - PAD_LEFT - PAD_RIGHT}
-              height={yFor(0) - PAD_TOP}
-            />
-          </clipPath>
-        </defs>
-
-        {/* Nowcast band background (faint blue tint for the forecast region) */}
-        <rect
-          x={nowcastX}
-          y={PAD_TOP}
-          width={W - PAD_RIGHT - nowcastX}
-          height={innerH}
-          fill={PRIMARY}
-          fillOpacity={0.04}
-        />
-
-        {/* Reference lines */}
-        {refs.map((r) => {
-          if (r.value > maxMmh) return null;
-          const y = yFor(r.value);
-          return (
-            <line
-              key={r.label}
-              x1={PAD_LEFT}
-              y1={y}
-              x2={W - PAD_RIGHT}
-              y2={y}
-              stroke={BORDER}
-              strokeWidth={1}
-              strokeDasharray="4 4"
-              vectorEffect="non-scaling-stroke"
-            />
-          );
-        })}
-
-        {/* Baseline */}
-        <line
-          x1={PAD_LEFT}
-          y1={yFor(0)}
-          x2={W - PAD_RIGHT}
-          y2={yFor(0)}
-          stroke={BORDER}
-          strokeWidth={1}
-          vectorEffect="non-scaling-stroke"
-        />
-
-        {/* Area fill — clipped so it can never render below baseline */}
-        {points.length > 1 && (
-          <path d={fillPath} fill="url(#rainFill)" clipPath="url(#graphClip)" />
-        )}
-
-        {/* Smooth line on top — also clipped to the plot area */}
-        {points.length > 1 && (
-          <path
-            d={linePath}
-            fill="none"
-            stroke={PRIMARY}
-            strokeWidth={2.5}
-            strokeLinejoin="round"
-            strokeLinecap="round"
-            vectorEffect="non-scaling-stroke"
-            clipPath="url(#graphClip)"
-          />
-        )}
-
-        {/* Forecast (Open-Meteo) wash — mute the right portion */}
-        <rect
-          x={nowcastX}
-          y={PAD_TOP}
-          width={W - PAD_RIGHT - nowcastX}
-          height={innerH}
-          fill="#ffffff"
-          fillOpacity={0.55}
-          clipPath="url(#graphClip)"
-          pointerEvents="none"
-        />
-
-        {/* Vertical separator at wall-clock NOW */}
-        <line
-          x1={nowcastX}
-          y1={PAD_TOP}
-          x2={nowcastX}
-          y2={H - PAD_BOTTOM}
-          stroke={PRIMARY}
-          strokeWidth={1}
-          strokeDasharray="2 3"
-          strokeOpacity={0.5}
-          vectorEffect="non-scaling-stroke"
-        />
-
-        {/* Current frame indicator — position is driven by direct DOM
-            manipulation (setAttribute on x1/x2 and the group's transform)
-            from the parent's animation setInterval. The `x1`/`x2` JSX values
-            are only the INITIAL position; the parent overrides on every
-            interval tick. */}
-        <line
-          ref={(el) => {
-            if (markerLineRef) markerLineRef.current = el;
-            if (el && isFinite(initialMarkerX)) {
-              el.setAttribute("x1", String(initialMarkerX));
-              el.setAttribute("x2", String(initialMarkerX));
-            }
-          }}
-          y1={PAD_TOP}
-          y2={H - PAD_BOTTOM}
-          stroke={PRIMARY}
-          strokeWidth={1.5}
-          strokeDasharray="3 3"
-          vectorEffect="non-scaling-stroke"
-          opacity={0.7}
-        />
-        <g
-          ref={(el) => {
-            if (markerCircleGroupRef) markerCircleGroupRef.current = el;
-            if (el && isFinite(initialMarkerX)) {
-              el.setAttribute(
-                "transform",
-                `translate(${initialMarkerX}, ${H - PAD_BOTTOM})`
-              );
-            }
-          }}
-        >
-          <circle
-            cx={0}
-            cy={0}
-            r={9}
-            fill={PRIMARY}
-            fillOpacity={0.2}
-            vectorEffect="non-scaling-stroke"
-          />
-          <circle
-            cx={0}
-            cy={0}
-            r={4.5}
-            fill="#fff"
-            stroke={PRIMARY}
-            strokeWidth={2.5}
-            vectorEffect="non-scaling-stroke"
-          />
-        </g>
-      </svg>
-
-      {/* HTML overlay for non-stretched labels */}
-      <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-        {/* (Prognos pill removed — forecast zone is visually distinct via the
-            lighter background wash on the right side of the wall-clock divider.) */}
-        {/* Y reference labels */}
-        {refs.map((r) => {
+        {/* Y-axis reference lines */}
+        {refs.map((ref) => {
+          const y = yFor(ref.value);
           return (
             <div
-              key={"lbl_" + r.label}
+              key={ref.label}
               style={{
                 position: "absolute",
-                left: 6,
-                top: `calc(${yPct(r.value)}% - 8px)`,
-                fontSize: 11,
-                color: MUTED,
-                fontWeight: 500,
-                background: "rgba(255,255,255,0.85)",
-                padding: "0 4px",
-                borderRadius: 3,
-                whiteSpace: "nowrap",
+                left: 0,
+                right: 0,
+                top: y,
+                borderTop: `1px dashed ${BORDER}`,
+                pointerEvents: "none",
               }}
             >
-              {r.label} {formatMmh(r.value)}
+              <span
+                style={{
+                  position: "absolute",
+                  left: 4,
+                  top: -8,
+                  fontSize: 10,
+                  color: MUTED,
+                  background: "rgba(255,255,255,0.85)",
+                  padding: "0 4px",
+                  borderRadius: 3,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {ref.label} {formatMmh(ref.value)}
+              </span>
             </div>
           );
         })}
-        {/* X-axis time labels — every 15 min so the past-15-min portion
-            always has at least one label (now-15min), spanning the ±2h-ish
-            visible window from `tMin = now - 15min` to `tMax = now + 2h`. */}
-        {(() => {
-          const out: any[] = [];
-          // Round down to the nearest 15-min mark below tMin
-          const firstTick = Math.floor(tMin / 900) * 900;
-          for (let t = firstTick; t <= tMax + 60; t += 900) {
-            if (t < tMin) continue;
-            const isOnHour = t % 3600 === 0;
-            const isOnHalfHour = !isOnHour && t % 1800 === 0;
-            const isOnQuarter = !isOnHour && !isOnHalfHour; // 15- or 45-min mark
-            const isNow = Math.abs(t - now) < 450; // within 7.5 min of now
-            out.push(
-              <div
-                key={"xt_" + t}
-                style={{
-                  position: "absolute",
-                  left: `${(xForTime(t) / W) * 100}%`,
-                  transform: "translateX(-50%)",
-                  bottom: 0,
-                  fontSize: isOnHour ? 11 : isOnHalfHour ? 10 : 9,
-                  color: isNow ? PRIMARY : MUTED,
-                  fontWeight: isNow ? 700 : isOnHour ? 600 : 400,
-                  whiteSpace: "nowrap",
-                  opacity: isOnHour ? 1 : isOnHalfHour ? 0.75 : 0.5,
-                }}
-              >
-                {formatTime(t)}
-              </div>
-            );
-          }
-          return out;
-        })()}
+        {/* Bars */}
+        {frames.map((f, i) => {
+          const v = intensities[i];
+          const active = i === currentIdx;
+          const h = v != null && v > 0 ? Math.max(2, (v / maxMmh) * (graphH - 4)) : 1;
+          const intensityRatio = (v ?? 0) / Math.max(0.001, maxMmh);
+          const color =
+            v == null
+              ? "#E2E8F0"
+              : v < 0.05
+              ? "#CBD5E1"
+              : interpolateBlue(intensityRatio);
+          return (
+            <div
+              key={f.time + "_b_" + i}
+              data-testid={`bar-${i}`}
+              style={{
+                flex: 1,
+                height: h,
+                background: color,
+                borderRadius: 3,
+                minWidth: 2,
+                outline: active ? `2px solid ${PRIMARY}` : "none",
+                outlineOffset: 0,
+                opacity: f.isNowcast ? 0.85 : 1,
+                position: "relative",
+                transition: "height 0.25s ease-out",
+              }}
+              title={`${formatTime(f.time)} · ${v == null ? "…" : formatMmh(v) + " mm/h"}`}
+            />
+          );
+        })}
+      </div>
+      {/* X axis labels */}
+      <div
+        style={{
+          display: "flex",
+          gap: 3,
+          paddingLeft: 70,
+          paddingRight: 4,
+          marginTop: 4,
+          fontSize: 9,
+          color: MUTED,
+        }}
+      >
+        {frames.map((f, i) => (
+          <div
+            key={f.time + "_t_" + i}
+            style={{
+              flex: 1,
+              textAlign: "center",
+              visibility: i % labelEvery === 0 ? "visible" : "hidden",
+              fontWeight: i === currentIdx ? 700 : 500,
+              color: i === currentIdx ? PRIMARY : MUTED,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {formatTime(f.time)}
+          </div>
+        ))}
       </div>
     </div>
   );
