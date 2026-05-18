@@ -269,42 +269,58 @@ export default function Regnradar() {
     return () => clearInterval(id);
   }, [fetchFrames]);
 
-  // ─── Render current radar frame as a tile layer ─────────────────────────────
+  // ─── Render current radar frame as a tile layer (cross-fade) ────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
     const f = frames[currentIdx];
     if (!f) return;
+    const TARGET_OPACITY = 0.7;
+    const FADE_MS = 400;
     const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
     const next = L.tileLayer(url, {
       tileSize: 256,
-      opacity: 0.7,
-      zIndex: 400,
+      opacity: 0,
+      zIndex: 401,
       maxNativeZoom: 7,
       minNativeZoom: 0,
       maxZoom: 18,
       attribution: "© RainViewer",
     });
     next.addTo(map);
-    // Remove previous after the new one paints to avoid flicker
     const old = radarLayerRef.current;
     radarLayerRef.current = next;
-    next.on("load", () => {
-      if (old) {
+
+    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+    let rafId: number;
+    const startFade = () => {
+      const t0 = performance.now();
+      const oldStart = old ? (old.options.opacity ?? TARGET_OPACITY) : 0;
+      const tick = (now: number) => {
+        const p = Math.min(1, (now - t0) / FADE_MS);
+        const e = easeOutCubic(p);
         try {
-          map.removeLayer(old);
+          next.setOpacity(TARGET_OPACITY * e);
+          if (old) old.setOpacity(oldStart * (1 - e));
         } catch {}
-      }
-    });
-    // Safety: remove old after 1.5s even if 'load' didn't fire
-    const t = setTimeout(() => {
-      if (old && map.hasLayer(old)) {
-        try {
-          map.removeLayer(old);
-        } catch {}
-      }
-    }, 1500);
-    return () => clearTimeout(t);
+        if (p < 1) {
+          rafId = requestAnimationFrame(tick);
+        } else if (old) {
+          try { map.removeLayer(old); } catch {}
+        }
+      };
+      rafId = requestAnimationFrame(tick);
+    };
+    // Wait for new tiles to paint before fading — fall back to short delay
+    let started = false;
+    const start = () => { if (!started) { started = true; startFade(); } };
+    next.on("load", start);
+    const fallback = setTimeout(start, 350);
+
+    return () => {
+      clearTimeout(fallback);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
   }, [frames, currentIdx]);
 
   // ─── Animation loop ─────────────────────────────────────────────────────────
@@ -416,9 +432,8 @@ export default function Regnradar() {
     }
   }, [frames, intensities]);
 
-  // ─── Current intensity ──────────────────────────────────────────────────────
+  // ─── Current intensity (with moving average + smooth tween) ─────────────────
   const currentMmh = useMemo(() => {
-    // Use the nearest "past" frame to now
     if (!frames.length || !intensities.length) return 0;
     const now = Date.now() / 1000;
     let best = -1;
@@ -431,8 +446,44 @@ export default function Regnradar() {
         best = i;
       }
     }
-    return intensities[best] ?? 0;
+    // 3-frame moving average centred on the "current" past frame to dampen jitter
+    const window: number[] = [];
+    for (let i = Math.max(0, best - 1); i <= Math.min(frames.length - 1, best + 1); i++) {
+      const v = intensities[i];
+      if (v != null) window.push(v);
+    }
+    if (!window.length) return intensities[best] ?? 0;
+    return window.reduce((a, b) => a + b, 0) / window.length;
   }, [frames, intensities]);
+
+  // Tween the displayed mm/h value smoothly when target changes
+  const [displayedMmh, setDisplayedMmh] = useState(0);
+  const displayedRef = useRef(0);
+  const tweenRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+    const start = displayedRef.current;
+    const target = currentMmh;
+    if (Math.abs(start - target) < 0.01) {
+      displayedRef.current = target;
+      setDisplayedMmh(target);
+      return;
+    }
+    const t0 = performance.now();
+    const dur = 320;
+    const ease = (t: number) => 1 - Math.pow(1 - t, 3);
+    const tick = (now: number) => {
+      const p = Math.min(1, (now - t0) / dur);
+      const v = start + (target - start) * ease(p);
+      displayedRef.current = v;
+      setDisplayedMmh(v);
+      if (p < 1) tweenRafRef.current = requestAnimationFrame(tick);
+    };
+    tweenRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
+    };
+  }, [currentMmh]);
 
   // ─── Handlers ───────────────────────────────────────────────────────────────
   const togglePlay = () => setPlaying((p) => !p);
@@ -498,10 +549,10 @@ export default function Regnradar() {
               data-testid="current-intensity"
               style={{ fontSize: 28, fontWeight: 700, color: TEXT, lineHeight: 1.1 }}
             >
-              {formatMmh(currentMmh)}
+              {formatMmh(displayedMmh)}
             </span>
             <span style={{ fontSize: 14, color: MUTED, fontWeight: 500 }}>mm/t</span>
-            {currentMmh < 0.05 && (
+            {displayedMmh < 0.05 && (
               <span style={{ fontSize: 13, color: MUTED, marginLeft: 8 }}>· Uppehåll</span>
             )}
           </div>
@@ -919,126 +970,244 @@ function RainGraph({
       </div>
     );
   }
-  const maxMmh = Math.max(
-    5.5,
-    ...intensities.map((v) => v ?? 0)
-  );
-  const graphH = 120;
+
+  // Layout constants — drawn into an SVG with a fixed viewBox, stretched to width
+  const W = 1000;
+  const H = 160;
+  const PAD_LEFT = 56;
+  const PAD_RIGHT = 16;
+  const PAD_TOP = 10;
+  const PAD_BOTTOM = 22;
+  const innerW = W - PAD_LEFT - PAD_RIGHT;
+  const innerH = H - PAD_TOP - PAD_BOTTOM;
+
+  const maxMmh = Math.max(5.5, ...intensities.map((v) => v ?? 0));
+  const xFor = (i: number) =>
+    PAD_LEFT + (frames.length === 1 ? innerW / 2 : (i / (frames.length - 1)) * innerW);
+  const yFor = (v: number) => PAD_TOP + (1 - v / maxMmh) * innerH;
+
+  // Build smooth path via monotone cubic interpolation (Catmull-Rom-ish)
+  // Skip null intensities — anchor the curve to the previous valid point.
+  type P = { x: number; y: number; v: number };
+  const points: P[] = [];
+  for (let i = 0; i < frames.length; i++) {
+    const v = intensities[i];
+    if (v == null) continue;
+    points.push({ x: xFor(i), y: yFor(Math.max(0, v)), v });
+  }
+
+  // Cardinal spline path (smooth) — uses tension 0.5
+  function buildPath(pts: P[], close: boolean) {
+    if (pts.length === 0) return "";
+    if (pts.length === 1) {
+      const p = pts[0];
+      return close
+        ? `M ${p.x} ${yFor(0)} L ${p.x} ${p.y} L ${p.x} ${yFor(0)} Z`
+        : `M ${p.x} ${p.y}`;
+    }
+    let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i - 1] || pts[i];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[i + 2] || p2;
+      // Catmull-Rom to Bézier with tension = 0.5
+      const t = 0.5;
+      const cp1x = p1.x + ((p2.x - p0.x) / 6) * t * 2;
+      const cp1y = p1.y + ((p2.y - p0.y) / 6) * t * 2;
+      const cp2x = p2.x - ((p3.x - p1.x) / 6) * t * 2;
+      const cp2y = p2.y - ((p3.y - p1.y) / 6) * t * 2;
+      d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
+    }
+    if (close) {
+      const last = pts[pts.length - 1];
+      const first = pts[0];
+      const baseY = yFor(0);
+      d += ` L ${last.x.toFixed(2)} ${baseY.toFixed(2)} L ${first.x.toFixed(2)} ${baseY.toFixed(2)} Z`;
+    }
+    return d;
+  }
+
+  const linePath = buildPath(points, false);
+  const fillPath = buildPath(points, true);
+
+  // Locate where the nowcast (future) section begins — to lighten that area
+  const nowcastStartIdx = frames.findIndex((f) => f.isNowcast);
+  const nowcastX = nowcastStartIdx > 0 ? xFor(nowcastStartIdx) : null;
+
+  // Current frame marker
+  const curX = xFor(currentIdx);
+  const curV = intensities[currentIdx];
+  const curY = curV != null ? yFor(Math.max(0, curV)) : null;
+
+  // X-axis labels
   const labelEvery = Math.max(1, Math.floor(frames.length / 6));
 
-  const yFor = (v: number) => (1 - v / maxMmh) * graphH;
+  const refs = [
+    { label: "kraftigt", value: 5 },
+    { label: "måttligt", value: 1 },
+  ];
+
+  // For HTML overlay positioning, express y-positions as percentages of total SVG height
+  const yPct = (v: number) => ((PAD_TOP + (1 - v / maxMmh) * innerH) / H) * 100;
+  const xPct = (i: number) => (xFor(i) / W) * 100;
 
   return (
-    <div style={{ position: "relative" }}>
-      <div
-        style={{
-          position: "relative",
-          height: graphH,
-          display: "flex",
-          alignItems: "flex-end",
-          gap: 3,
-          paddingLeft: 32,
-          paddingRight: 4,
-          background: "linear-gradient(180deg, #F8FAFC 0%, #fff 100%)",
-          borderRadius: 8,
-          borderBottom: `1px solid ${BORDER}`,
-        }}
+    <div style={{ position: "relative", width: "100%" }}>
+      <svg
+        data-testid="rain-graph-svg"
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        style={{ display: "block", width: "100%", height: 160 }}
       >
-        {/* Y axis lines: måttligt 1 mm/h, kraftigt 5 mm/h */}
-        {[
-          { label: "kraftigt", value: 5 },
-          { label: "måttligt", value: 1 },
-        ].map((ref) => {
-          if (ref.value > maxMmh) return null;
-          const y = yFor(ref.value);
+        <defs>
+          <linearGradient id="rainFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={PRIMARY} stopOpacity="0.85" />
+            <stop offset="55%" stopColor={PRIMARY} stopOpacity="0.35" />
+            <stop offset="100%" stopColor={PRIMARY} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+
+        {/* Nowcast band background */}
+        {nowcastX !== null && (
+          <rect
+            x={nowcastX}
+            y={PAD_TOP}
+            width={W - PAD_RIGHT - nowcastX}
+            height={innerH}
+            fill={PRIMARY}
+            fillOpacity={0.04}
+          />
+        )}
+
+        {/* Reference lines */}
+        {refs.map((r) => {
+          if (r.value > maxMmh) return null;
+          const y = yFor(r.value);
           return (
-            <div
-              key={ref.label}
-              style={{
-                position: "absolute",
-                left: 0,
-                right: 0,
-                top: y,
-                borderTop: `1px dashed ${BORDER}`,
-                pointerEvents: "none",
-              }}
-            >
-              <span
-                style={{
-                  position: "absolute",
-                  left: 0,
-                  top: -8,
-                  fontSize: 10,
-                  color: MUTED,
-                  background: "#fff",
-                  padding: "0 4px",
-                  borderRadius: 3,
-                }}
-              >
-                {ref.label} {ref.value}
-              </span>
-            </div>
-          );
-        })}
-        {/* Bars */}
-        {frames.map((f, i) => {
-          const v = intensities[i];
-          const active = i === currentIdx;
-          const h = v ? Math.max(2, (v / maxMmh) * (graphH - 4)) : 1;
-          const intensity = (v ?? 0) / Math.max(0.001, maxMmh);
-          const color =
-            v == null
-              ? "#E2E8F0"
-              : v < 0.05
-              ? "#CBD5E1"
-              : interpolateBlue(intensity);
-          return (
-            <div
-              key={f.time + "_b_" + i}
-              data-testid={`bar-${i}`}
-              style={{
-                flex: 1,
-                height: h,
-                background: color,
-                borderRadius: 3,
-                minWidth: 2,
-                outline: active ? `2px solid ${PRIMARY}` : "none",
-                outlineOffset: 0,
-                opacity: f.isNowcast ? 0.85 : 1,
-                position: "relative",
-                transition: "height 0.2s",
-              }}
-              title={`${formatTime(f.time)} · ${v == null ? "…" : formatMmh(v) + " mm/h"}`}
+            <line
+              key={r.label}
+              x1={PAD_LEFT}
+              y1={y}
+              x2={W - PAD_RIGHT}
+              y2={y}
+              stroke={BORDER}
+              strokeWidth={1}
+              strokeDasharray="4 4"
+              vectorEffect="non-scaling-stroke"
             />
           );
         })}
-      </div>
-      {/* X axis labels */}
-      <div
-        style={{
-          display: "flex",
-          gap: 3,
-          paddingLeft: 32,
-          paddingRight: 4,
-          marginTop: 4,
-          fontSize: 9,
-          color: MUTED,
-        }}
-      >
-        {frames.map((f, i) => (
-          <div
-            key={f.time + "_t_" + i}
-            style={{
-              flex: 1,
-              textAlign: "center",
-              visibility: i % labelEvery === 0 ? "visible" : "hidden",
-              fontWeight: i === currentIdx ? 700 : 500,
-              color: i === currentIdx ? PRIMARY : MUTED,
-            }}
-          >
-            {formatTime(f.time)}
-          </div>
-        ))}
+
+        {/* Baseline */}
+        <line
+          x1={PAD_LEFT}
+          y1={yFor(0)}
+          x2={W - PAD_RIGHT}
+          y2={yFor(0)}
+          stroke={BORDER}
+          strokeWidth={1}
+          vectorEffect="non-scaling-stroke"
+        />
+
+        {/* Area fill */}
+        {points.length > 1 && <path d={fillPath} fill="url(#rainFill)" />}
+
+        {/* Smooth line on top */}
+        {points.length > 1 && (
+          <path
+            d={linePath}
+            fill="none"
+            stroke={PRIMARY}
+            strokeWidth={2.5}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+
+        {/* Current frame indicator */}
+        <line
+          x1={curX}
+          y1={PAD_TOP}
+          x2={curX}
+          y2={H - PAD_BOTTOM}
+          stroke={PRIMARY}
+          strokeWidth={1.5}
+          strokeDasharray="3 3"
+          vectorEffect="non-scaling-stroke"
+          opacity={0.55}
+        />
+        {curY != null && (
+          <g>
+            <circle
+              cx={curX}
+              cy={curY}
+              r={9}
+              fill={PRIMARY}
+              fillOpacity={0.2}
+              vectorEffect="non-scaling-stroke"
+            />
+            <circle
+              cx={curX}
+              cy={curY}
+              r={4.5}
+              fill="#fff"
+              stroke={PRIMARY}
+              strokeWidth={2.5}
+              vectorEffect="non-scaling-stroke"
+            />
+          </g>
+        )}
+      </svg>
+
+      {/* HTML overlay for non-stretched labels */}
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+        {/* Y reference labels */}
+        {refs.map((r) => {
+          if (r.value > maxMmh) return null;
+          return (
+            <div
+              key={"lbl_" + r.label}
+              style={{
+                position: "absolute",
+                left: 6,
+                top: `calc(${yPct(r.value)}% - 8px)`,
+                fontSize: 11,
+                color: MUTED,
+                fontWeight: 500,
+                background: "rgba(255,255,255,0.85)",
+                padding: "0 4px",
+                borderRadius: 3,
+                whiteSpace: "nowrap",
+              }}
+            >
+              {r.label} {r.value}
+            </div>
+          );
+        })}
+        {/* X-axis time labels */}
+        {frames.map((f, i) => {
+          if (i % labelEvery !== 0) return null;
+          const active = i === currentIdx;
+          return (
+            <div
+              key={"xt_" + f.time + "_" + i}
+              style={{
+                position: "absolute",
+                left: `${xPct(i)}%`,
+                transform: "translateX(-50%)",
+                bottom: 0,
+                fontSize: 11,
+                color: active ? PRIMARY : MUTED,
+                fontWeight: active ? 700 : 500,
+                whiteSpace: "nowrap",
+              }}
+            >
+              {formatTime(f.time)}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
