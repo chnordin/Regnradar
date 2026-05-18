@@ -413,8 +413,7 @@ export default function Regnradar() {
         const values: (number | null)[] = data?.minutely_15?.precipitation || [];
         // Open-Meteo returns naive local-time strings ("2026-02-18T15:30") in the
         // location's timezone. Parse as UTC then subtract utc_offset_seconds to
-        // get the true UTC moment. This makes precip.time directly comparable
-        // to the RainViewer frame timestamps (UNIX seconds, UTC).
+        // get the true UTC moment. Comparable to RainViewer's UTC frame stamps.
         const utcOffset = Number(data?.utc_offset_seconds || 0);
         const nowS = Date.now() / 1000;
         const parsed = times
@@ -423,8 +422,34 @@ export default function Regnradar() {
             const mm15 = values[i] ?? 0;
             return { time: ts, mmh: Math.max(0, mm15 * 4) };
           })
-          // Keep a generous window around "now" (-3h ↔ +3h) — radar timeline fits inside.
           .filter((p) => p.time >= nowS - 3 * 3600 && p.time <= nowS + 3 * 3600);
+
+        // Debug: log raw times vs device time to verify alignment (user requested)
+        if (typeof console !== "undefined") {
+          const nowDev = new Date();
+          const sample = times.slice(0, 3).concat(times.slice(-2));
+          // eslint-disable-next-line no-console
+          console.log(
+            "[Regnradar] Open-Meteo tz=" +
+              data?.timezone +
+              " offset=" + utcOffset + "s" +
+              " device(UTC)=" + nowDev.toISOString() +
+              " device(local)=" + nowDev.toString().slice(0, 25) +
+              " sample raw times=" + JSON.stringify(sample) +
+              " parsed.length=" + parsed.length
+          );
+          if (parsed.length) {
+            const nearest = parsed.reduce((best, p) =>
+              Math.abs(p.time - nowS) < Math.abs(best.time - nowS) ? p : best
+            );
+            // eslint-disable-next-line no-console
+            console.log(
+              "[Regnradar] Nearest precip to now: mmh=" + nearest.mmh.toFixed(2) +
+                " at " + new Date(nearest.time * 1000).toISOString()
+            );
+          }
+        }
+
         if (!cancelled) setPrecip(parsed);
       } catch (e) {
         console.warn("Open-Meteo fetch failed", e);
@@ -482,25 +507,44 @@ export default function Regnradar() {
     }
   }, [precip]);
 
-  // ─── Current intensity — Open-Meteo entry matching the current radar frame ──
+  // ─── Current intensity — Open-Meteo value at the current 15-min interval ────
+  // Always anchored to wall-clock NOW (independent of radar scrub position).
+  // We pick the interval whose start time is closest to "now", preferring the
+  // most recent past interval so the displayed mm/h matches what's currently
+  // falling — exactly what the user sees on the radar above their location.
+  const [, setNowTick] = useState(0);
+  useEffect(() => {
+    // Re-evaluate every 30s so the readout follows wall-clock time
+    const id = setInterval(() => setNowTick((n) => n + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
   const currentMmh = useMemo(() => {
     if (!precip.length) return 0;
-    // Use the time the user is "looking at" — current radar frame's time when
-    // animating/scrubbing, otherwise wall-clock.
-    const refTime =
-      frames.length && frames[currentIdx] ? frames[currentIdx].time : Date.now() / 1000;
-    // Pick the most recent 15-min interval whose start is at or before refTime.
-    let bestIdx = -1;
-    let bestDt = Infinity;
-    for (let i = 0; i < precip.length; i++) {
-      const dt = Math.abs(precip[i].time - refTime);
-      if (dt < bestDt) {
-        bestDt = dt;
-        bestIdx = i;
+    const now = Date.now() / 1000;
+    // Pick the most recent 15-min slot whose start is at or before `now`
+    // (i.e. the slot we are currently INSIDE). Each slot covers [t, t+900s).
+    // This is what the user actually sees on the radar above their head.
+    let pick: { time: number; mmh: number } | null = null;
+    for (const p of precip) {
+      if (p.time <= now && (!pick || p.time > pick.time)) {
+        pick = p;
       }
     }
-    return bestIdx >= 0 ? precip[bestIdx].mmh : 0;
-  }, [precip, frames, currentIdx]);
+    // Fallback: if no past/current slot found (e.g. user is before the first
+    // returned entry), use the closest entry overall.
+    if (!pick) {
+      let bestDt = Infinity;
+      for (const p of precip) {
+        const dt = Math.abs(p.time - now);
+        if (dt < bestDt) {
+          bestDt = dt;
+          pick = p;
+        }
+      }
+    }
+    return pick ? pick.mmh : 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [precip]);
 
   // Tween the displayed mm/h value smoothly when target changes
   const [displayedMmh, setDisplayedMmh] = useState(0);
@@ -1294,7 +1338,17 @@ function RainGraph({
   };
 
   return (
-    <div style={{ position: "relative", width: "100%" }}>
+    <div
+      style={{
+        position: "relative",
+        width: "100%",
+        overflow: "hidden",
+        userSelect: "none",
+        WebkitUserSelect: "none",
+        WebkitTouchCallout: "none",
+        WebkitTapHighlightColor: "transparent",
+      }}
+    >
       <svg
         ref={svgRef}
         data-testid="rain-graph-svg"
@@ -1306,19 +1360,27 @@ function RainGraph({
           height: 160,
           touchAction: "none",
           userSelect: "none",
+          WebkitUserSelect: "none",
+          WebkitTouchCallout: "none",
+          WebkitTapHighlightColor: "transparent",
           cursor: onScrub ? "ew-resize" : "default",
         }}
         onTouchStart={(e) => {
+          if (e.cancelable) e.preventDefault();
           if (e.touches.length) handleScrubStart(e.touches[0].clientX);
         }}
         onTouchMove={(e) => {
-          if (e.touches.length) {
-            e.preventDefault();
-            handleScrubMove(e.touches[0].clientX);
-          }
+          if (e.cancelable) e.preventDefault();
+          if (e.touches.length) handleScrubMove(e.touches[0].clientX);
         }}
-        onTouchEnd={handleScrubEnd}
-        onTouchCancel={handleScrubEnd}
+        onTouchEnd={(e) => {
+          if (e.cancelable) e.preventDefault();
+          handleScrubEnd();
+        }}
+        onTouchCancel={(e) => {
+          if (e.cancelable) e.preventDefault();
+          handleScrubEnd();
+        }}
         onMouseDown={(e) => {
           handleScrubStart(e.clientX);
         }}
