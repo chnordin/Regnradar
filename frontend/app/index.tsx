@@ -82,7 +82,8 @@ export default function Regnradar() {
   const mapEl = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const userMarkerRef = useRef<any>(null);
-  const radarLayerRef = useRef<any>(null);
+  const radarLayersRef = useRef<Set<any>>(new Set());
+  const activeFadeRef = useRef<number | null>(null);
   const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
@@ -278,70 +279,107 @@ export default function Regnradar() {
     return () => clearInterval(id);
   }, [fetchFrames]);
 
-  // ─── Render current radar frame as a tile layer (preload + cross-fade) ──────
+  // ─── Render current radar frame as a tile layer (strict single-layer) ──────
+  // Maintains AT MOST one previous "outgoing" layer + one new "incoming" layer.
+  // On every frame change ALL other tracked layers are removed immediately and
+  // any in-progress cross-fade is cancelled — guarantees no ghost stacking
+  // during rapid scrubbing.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
     const f = frames[currentIdx];
     if (!f) return;
+
     const TARGET_OPACITY = 0.7;
     const FADE_MS = 350;
+
+    // 1. Cancel any in-progress fade animation immediately.
+    if (activeFadeRef.current) {
+      cancelAnimationFrame(activeFadeRef.current);
+      activeFadeRef.current = null;
+    }
+
+    // 2. Snapshot existing layers. Keep only the MOST RECENT one as the
+    //    outgoing partner for the cross-fade — wipe all others immediately
+    //    so they cannot stack as ghosts.
+    const existing = Array.from(radarLayersRef.current);
+    const outgoing = existing.length ? existing[existing.length - 1] : null;
+    for (const layer of existing) {
+      if (layer === outgoing) continue;
+      try {
+        layer.setOpacity(0);
+        map.removeLayer(layer);
+      } catch {}
+      radarLayersRef.current.delete(layer);
+    }
+
+    // 3. Add the new layer at opacity 0.
     const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
-    const next = L.tileLayer(url, {
+    const incoming = L.tileLayer(url, {
       tileSize: 256,
-      opacity: 0,           // start invisible — fade in only AFTER tiles have loaded
+      opacity: 0,
       zIndex: 401,
       maxNativeZoom: 7,
       minNativeZoom: 0,
       maxZoom: 18,
-      fadeAnimation: false, // disable Leaflet's own per-tile fade to avoid double-flicker
-      keepBuffer: 4,        // keep a generous tile cache around the viewport
+      fadeAnimation: false,
+      keepBuffer: 4,
       updateWhenIdle: false,
       attribution: "© RainViewer",
     });
-    next.addTo(map);
-    const old = radarLayerRef.current;
-    radarLayerRef.current = next;
+    incoming.addTo(map);
+    radarLayersRef.current.add(incoming);
 
-    let rafId: number | null = null;
     let fallbackId: any = null;
     let started = false;
 
-    const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+    const removeOutgoing = () => {
+      if (!outgoing) return;
+      try {
+        outgoing.setOpacity(0);
+        map.removeLayer(outgoing);
+      } catch {}
+      radarLayersRef.current.delete(outgoing);
+    };
 
     const startFade = () => {
       if (started) return;
       started = true;
       if (fallbackId) clearTimeout(fallbackId);
-      const oldStart = old ? (old.options.opacity ?? TARGET_OPACITY) : 0;
+
+      const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+      const outStart = outgoing ? (outgoing.options.opacity ?? TARGET_OPACITY) : 0;
       const t0 = performance.now();
+
       const tick = (now: number) => {
         const p = Math.min(1, (now - t0) / FADE_MS);
         const e = easeOutCubic(p);
         try {
-          next.setOpacity(TARGET_OPACITY * e);
-          if (old) old.setOpacity(oldStart * (1 - e));
+          incoming.setOpacity(TARGET_OPACITY * e);
+          if (outgoing) outgoing.setOpacity(outStart * (1 - e));
         } catch {}
         if (p < 1) {
-          rafId = requestAnimationFrame(tick);
+          activeFadeRef.current = requestAnimationFrame(tick);
         } else {
-          // Fully faded in — now safe to drop the old layer
-          if (old) {
-            try { map.removeLayer(old); } catch {}
-          }
+          activeFadeRef.current = null;
+          removeOutgoing();
         }
       };
-      rafId = requestAnimationFrame(tick);
+      activeFadeRef.current = requestAnimationFrame(tick);
     };
 
-    // Leaflet fires "load" when every tile currently in the viewport has loaded.
-    next.on("load", startFade);
-    // Safety net: if "load" never fires (e.g. fully cached or off-screen tiles),
-    // start fading after a sensible delay anyway.
+    incoming.on("load", startFade);
+    // Fallback if 'load' never fires (e.g. all tiles cached).
     fallbackId = setTimeout(startFade, 800);
 
     return () => {
-      if (rafId) cancelAnimationFrame(rafId);
+      // Cancel pending fade / fallback. We do NOT touch radarLayersRef here —
+      // the next effect run will handle aggressive cleanup of every leftover
+      // layer so that even fast scrubbing converges to a single active layer.
+      if (activeFadeRef.current) {
+        cancelAnimationFrame(activeFadeRef.current);
+        activeFadeRef.current = null;
+      }
       if (fallbackId) clearTimeout(fallbackId);
     };
   }, [frames, currentIdx]);
@@ -1279,7 +1317,6 @@ function RainGraph({
         onTouchEnd={handleScrubEnd}
         onTouchCancel={handleScrubEnd}
         onMouseDown={(e) => {
-          (e.currentTarget as any).setPointerCapture?.((e as any).pointerId);
           handleScrubStart(e.clientX);
         }}
         onMouseMove={(e) => {
