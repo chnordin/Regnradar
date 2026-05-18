@@ -4,7 +4,7 @@
 A mobile-first, installable PWA that gives Swedish users a fast glance at incoming rain at their exact location — installed directly from Safari to the iPhone home screen, no App Store needed.
 
 ## Core Features (built)
-1. **Animated rain radar** — Leaflet + OpenStreetMap base map with Rain Viewer radar tiles (past 2h + 30 min nowcast). Auto-loops every 600 ms.
+1. **Animated rain radar** — Leaflet + OpenStreetMap base map with Rain Viewer radar tiles (last 15 min of past + up to 30 min nowcast). Animation loops smoothly through every frame (past → nowcast → wrap) at 600 ms/frame; 5-min refresh preserves the running index via `firstFetchRef`.
 2. **GPS-based centering** — On load, prompts for location and centers the map. Falls back to Stockholm if denied.
 3. **Reverse geocoded city name** — Via Nominatim (sv locale) shown at the top.
 4. **Rain intensity graph** — Smooth area chart of Open-Meteo `minutely_15` precipitation across a ±2h window around wall-clock NOW. Includes "måttligt" (1 mm/h) and "kraftigt" (5 mm/h) reference lines. Touch-scrubbable; the wall-clock-NOW divider separates past (Open-Meteo observations) from "PROGNOS" (Open-Meteo forecast).

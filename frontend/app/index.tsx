@@ -115,6 +115,10 @@ export default function Regnradar() {
   const [playing, setPlaying] = useState(true);
   const playTimerRef = useRef<any>(null);
   const scrubResumeRef = useRef<number | null>(null);
+  // Tracks whether this is the very first frame-list fetch. We only seek to
+  // "now" on the initial load — subsequent refreshes preserve the running
+  // animation index so the loop never resets mid-cycle.
+  const firstFetchRef = useRef(true);
 
   const [intensities] = useState<(number | null)[]>([]);
   // Note: kept as empty array shim — Open-Meteo `precip` is the sole source.
@@ -264,6 +268,8 @@ export default function Regnradar() {
   }, [coords?.lat, coords?.lng, leafletReady]);
 
   // ─── Fetch frames from Rain Viewer ──────────────────────────────────────────
+  // We keep only the last 15 min of past frames so the animation loop is short
+  // and tightly focused on "very recent + near-future" rain.
   const fetchFrames = useCallback(async () => {
     try {
       const r = await fetch("https://api.rainviewer.com/public/weather-maps.json", {
@@ -271,12 +277,15 @@ export default function Regnradar() {
       });
       const data = await r.json();
       const host = data.host || "https://tilecache.rainviewer.com";
-      const past = (data?.radar?.past || []).map((f: any) => ({
-        time: f.time,
-        path: f.path,
-        host,
-        isNowcast: false,
-      }));
+      const cutoff = Date.now() / 1000 - 15 * 60; // keep only last 15 min of past
+      const past = (data?.radar?.past || [])
+        .filter((f: any) => f.time >= cutoff)
+        .map((f: any) => ({
+          time: f.time,
+          path: f.path,
+          host,
+          isNowcast: false,
+        }));
       const nowcast = (data?.radar?.nowcast || []).map((f: any) => ({
         time: f.time,
         path: f.path,
@@ -286,9 +295,17 @@ export default function Regnradar() {
       const all = [...past, ...nowcast];
       setFrames(all);
       setCurrentIdx((idx) => {
-        // jump to "now" (last past frame) on first load
-        const lastPast = past.length - 1;
-        return idx === 0 && lastPast >= 0 ? lastPast : Math.min(idx, all.length - 1);
+        // On the very first fetch, seek to "now" (last past frame). On every
+        // subsequent refresh, preserve the running animation index — clamped
+        // to the new array length — so the loop continues smoothly through
+        // past → nowcast → wrap, without jumping back to "now".
+        if (firstFetchRef.current && all.length > 0) {
+          firstFetchRef.current = false;
+          const lastPast = past.length - 1;
+          return lastPast >= 0 ? lastPast : 0;
+        }
+        if (!all.length) return 0;
+        return Math.min(idx, all.length - 1);
       });
     } catch (e) {
       console.warn("RainViewer fetch failed", e);
@@ -429,7 +446,7 @@ export default function Regnradar() {
         const url =
           `https://api.open-meteo.com/v1/forecast?` +
           `latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
-          `&minutely_15=precipitation&past_hours=3&forecast_hours=3&timezone=auto`;
+          `&minutely_15=precipitation&past_hours=1&forecast_hours=3&timezone=auto`;
         const r = await fetch(url, { cache: "no-store", signal: controller.signal });
         clearTimeout(timeoutId);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -444,7 +461,7 @@ export default function Regnradar() {
             const mm15 = values[i] ?? 0;
             return { time: ts, mmh: Math.max(0, mm15 * 4) };
           })
-          .filter((p) => p.time >= nowS - 3 * 3600 && p.time <= nowS + 3 * 3600);
+          .filter((p) => p.time >= nowS - 15 * 60 && p.time <= nowS + 2 * 3600 + 60);
 
         if (typeof console !== "undefined") {
           // eslint-disable-next-line no-console
@@ -1234,8 +1251,8 @@ function RainGraph({
   const innerW = W - PAD_LEFT - PAD_RIGHT;
   const innerH = H - PAD_TOP - PAD_BOTTOM;
 
-  // ── Time-based X axis: ±2h around wall-clock NOW (now sits in the middle) ──
-  const tMin = now - 2 * 3600;
+  // ── Time-based X axis: -15min on the left, +2h on the right (now is offset) ──
+  const tMin = now - 15 * 60;
   const tMax = now + 2 * 3600;
   const xForTime = (t: number) =>
     PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
