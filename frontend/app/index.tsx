@@ -13,15 +13,10 @@ const MUTED = "#64748B";
 const BG = "#F8FAFC";
 const CARD = "#FFFFFF";
 const BORDER = "#E2E8F0";
-const SAMPLE_ZOOM = 6; // zoom level used for intensity sampling
 
-// Rain Viewer color scheme 2 (universal blue) dBZ approximation by hue
-// Rain Viewer "Universal Blue" (scheme 2) → dBZ.
-// The palette is overwhelmingly blue: very light cyan = trace, medium blue =
-// 1-3 mm/h, dark navy = 10-20 mm/h, with yellow/red rarely present for very
-// extreme echoes. We calibrate primarily by HSV darkness within the blue band
-// and treat semi-transparent / near-white pixels as no rain.
-function rgbToDbz(r: number, g: number, b: number, a: number): number {
+// (Removed: radar pixel-sampling helpers — Open-Meteo is now the only
+// precipitation data source for both past and forecast.)
+function _unused_rgbToDbz(r: number, g: number, b: number, a: number): number {
   // Hard cutoffs for "no echo".
   if (a < 40) return -10;
 
@@ -77,7 +72,7 @@ function dbzToMmh(dbz: number): number {
   return Math.max(0, Math.pow(Z / 200, 1 / 1.6));
 }
 
-function latLngToTilePx(lat: number, lng: number, zoom: number, tileSize = 512) {
+function _unused_latLngToTilePx(lat: number, lng: number, zoom: number, tileSize = 512) {
   const n = Math.pow(2, zoom);
   const x = ((lng + 180) / 360) * n;
   const latRad = (lat * Math.PI) / 180;
@@ -108,7 +103,6 @@ export default function Regnradar() {
   const userMarkerRef = useRef<any>(null);
   const radarLayersRef = useRef<Set<any>>(new Set());
   const activeFadeRef = useRef<number | null>(null);
-  const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [city, setCity] = useState<string>("Hämtar plats…");
@@ -122,7 +116,8 @@ export default function Regnradar() {
   const playTimerRef = useRef<any>(null);
   const scrubResumeRef = useRef<number | null>(null);
 
-  const [intensities, setIntensities] = useState<(number | null)[]>([]);
+  const [intensities] = useState<(number | null)[]>([]);
+  // Note: kept as empty array shim — Open-Meteo `precip` is the sole source.
   // Open-Meteo 15-min precipitation forecast — authoritative intensity source
   const [precip, setPrecip] = useState<{ time: number; mmh: number }[]>([]);
   const [precipError, setPrecipError] = useState<string | null>(null);
@@ -434,7 +429,7 @@ export default function Regnradar() {
         const url =
           `https://api.open-meteo.com/v1/forecast?` +
           `latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
-          `&minutely_15=precipitation&past_hours=3&forecast_hours=2&timezone=auto`;
+          `&minutely_15=precipitation&past_hours=3&forecast_hours=3&timezone=auto`;
         const r = await fetch(url, { cache: "no-store", signal: controller.signal });
         clearTimeout(timeoutId);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -486,73 +481,10 @@ export default function Regnradar() {
 
   // (Legacy pixel-sampling kept disabled — Open-Meteo is the authoritative source now.)
 
-  // ─── Pixel-sample radar tiles at user position for each PAST frame ──────────
-  // This gives us the observed historical intensity, which we plot on the
-  // left/past portion of the graph and surface in the mm/t readout when the
-  // animation is on a past frame. Open-Meteo handles the forecast portion.
-  useEffect(() => {
-    if (!coords || !frames.length) return;
-    let cancelled = false;
-    const { lat, lng } = coords;
-    const { tileX, tileY, px, py } = latLngToTilePx(lat, lng, SAMPLE_ZOOM, 256);
-
-    const sample = (frame: any) =>
-      new Promise<number | null>((resolve) => {
-        const url = `${frame.host}${frame.path}/256/${SAMPLE_ZOOM}/${tileX}/${tileY}/2/1_1.png`;
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        img.onload = () => {
-          try {
-            const cvs = sampleCanvasRef.current || document.createElement("canvas");
-            sampleCanvasRef.current = cvs;
-            cvs.width = 256;
-            cvs.height = 256;
-            const ctx = cvs.getContext("2d");
-            if (!ctx) return resolve(null);
-            ctx.clearRect(0, 0, 256, 256);
-            ctx.drawImage(img, 0, 0);
-            // Sample a 5×5 area for stability against single outlier pixels.
-            // Trimmed mean: drop the highest sample so a hot edge tile doesn't
-            // bias the average upward.
-            const mmhs: number[] = [];
-            for (let dy = -2; dy <= 2; dy++) {
-              for (let dx = -2; dx <= 2; dx++) {
-                const x = Math.max(0, Math.min(255, px + dx));
-                const y = Math.max(0, Math.min(255, py + dy));
-                const d = ctx.getImageData(x, y, 1, 1).data;
-                const dbz = rgbToDbz(d[0], d[1], d[2], d[3]);
-                mmhs.push(dbzToMmh(dbz));
-              }
-            }
-            if (!mmhs.length) return resolve(0);
-            mmhs.sort((a, b) => a - b);
-            // Drop the top sample, then average the remaining 24.
-            mmhs.pop();
-            const sum = mmhs.reduce((s, v) => s + v, 0);
-            resolve(sum / mmhs.length);
-          } catch (e) {
-            resolve(null);
-          }
-        };
-        img.onerror = () => resolve(null);
-        img.src = url;
-      });
-
-    (async () => {
-      const out: (number | null)[] = new Array(frames.length).fill(null);
-      for (let i = 0; i < frames.length; i++) {
-        if (cancelled) return;
-        // Only sample past frames — forecast comes from Open-Meteo.
-        if (frames[i].isNowcast) continue;
-        out[i] = await sample(frames[i]);
-        if (!cancelled) setIntensities([...out]);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [coords?.lat, coords?.lng, frames]);
+  // ─── Pixel-sampling removed: Open-Meteo is the only precipitation source ────
+  // The Open-Meteo fetch above already returns past_hours=3 + forecast_hours=3
+  // worth of minutely_15 precipitation, which covers both past and future on
+  // the graph and intensity readout.
 
   // ─── Rain warning — uses Open-Meteo: any of next 2 quarters > 0.1 mm/h ──────
   useEffect(() => {
@@ -604,33 +536,24 @@ export default function Regnradar() {
   }, []);
   const currentMmh = useMemo(() => {
     const frame = frames[currentIdx];
-    if (frame && frame.isNowcast) {
-      // Forecast portion: Open-Meteo value at the slot containing this frame's time.
-      if (!precip.length) return 0;
-      let pick: { time: number; mmh: number } | null = null;
+    // Open-Meteo is the ONLY source — pick the precip slot closest to the
+    // current frame's time, or to wall-clock NOW if no frame is ready yet.
+    if (!precip.length) return 0;
+    const targetT = frame ? frame.time : Date.now() / 1000;
+    let pick: { time: number; mmh: number } | null = null;
+    for (const p of precip) {
+      if (p.time <= targetT && (!pick || p.time > pick.time)) pick = p;
+    }
+    if (!pick) {
+      let bestDt = Infinity;
       for (const p of precip) {
-        if (p.time <= frame.time && (!pick || p.time > pick.time)) pick = p;
+        const dt = Math.abs(p.time - targetT);
+        if (dt < bestDt) { bestDt = dt; pick = p; }
       }
-      if (!pick) {
-        let bestDt = Infinity;
-        for (const p of precip) {
-          const dt = Math.abs(p.time - frame.time);
-          if (dt < bestDt) { bestDt = dt; pick = p; }
-        }
-      }
-      return pick ? pick.mmh : 0;
     }
-    // Past or unknown frame: use the radar-sampled value if available.
-    if (frame && intensities[currentIdx] != null) {
-      return intensities[currentIdx] as number;
-    }
-    // No frame yet — fall back to the latest past radar sample for wall-clock "now".
-    for (let i = frames.length - 1; i >= 0; i--) {
-      if (!frames[i].isNowcast && intensities[i] != null) return intensities[i] as number;
-    }
-    return 0;
+    return pick ? pick.mmh : 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frames, currentIdx, intensities, precip]);
+  }, [frames, currentIdx, precip]);
 
   // Tween the displayed mm/h value smoothly when target changes
   const [displayedMmh, setDisplayedMmh] = useState(0);
@@ -1221,10 +1144,9 @@ function RainGraph({
   const tweenRafRef = useRef<number | null>(null);
 
   // ── Build the combined source-of-truth data points ─────────────────────────
-  // PAST  → radar pixel-sampled intensity at each past frame's timestamp
-  // FUTURE → Open-Meteo minutely_15 entries strictly after wall-clock NOW
-  //          (radar nowcast frames are skipped here — Open-Meteo is the
-  //          forecast source so the "PROGNOS" zone is consistent.)
+  // Open-Meteo is the sole source. It returns minutely_15 precipitation across
+  // a ±3h window (past_hours=3 + forecast_hours=3). We render every entry that
+  // falls within our visible ±2h-around-now window.
   const [, setTick] = useState(0);
   useEffect(() => {
     // Re-render every 30s so the wall-clock-relative X-axis advances smoothly.
@@ -1233,21 +1155,8 @@ function RainGraph({
   }, []);
   const now = Date.now() / 1000;
   const combined: { time: number; mmh: number }[] = useMemo(() => {
-    const out: { time: number; mmh: number }[] = [];
-    for (let i = 0; i < frames.length; i++) {
-      const f = frames[i];
-      if (f.isNowcast) continue;
-      if (f.time > now) continue;
-      const v = intensities[i];
-      if (v != null) out.push({ time: f.time, mmh: v });
-    }
-    for (const p of precip) {
-      if (p.time > now) out.push({ time: p.time, mmh: p.mmh });
-    }
-    out.sort((a, b) => a.time - b.time);
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frames, intensities, precip, now]);
+    return [...precip].sort((a, b) => a.time - b.time);
+  }, [precip]);
 
   // ── Animated displayed values, keyed by time ───────────────────────────────
   const [displayed, setDisplayed] = useState<{ time: number; mmh: number }[]>(combined);

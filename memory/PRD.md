@@ -7,7 +7,7 @@ A mobile-first, installable PWA that gives Swedish users a fast glance at incomi
 1. **Animated rain radar** — Leaflet + OpenStreetMap base map with Rain Viewer radar tiles (past 2h + 30 min nowcast). Auto-loops every 600 ms.
 2. **GPS-based centering** — On load, prompts for location and centers the map. Falls back to Stockholm if denied.
 3. **Reverse geocoded city name** — Via Nominatim (sv locale) shown at the top.
-4. **Rain intensity graph** — Bars per radar frame, computed by sampling the radar tile pixel at the user's GPS coords. Includes "måttligt" (1 mm/h) and "kraftigt" (5 mm/h) reference lines. Current frame highlighted; synced with animation.
+4. **Rain intensity graph** — Smooth area chart of Open-Meteo `minutely_15` precipitation across a ±2h window around wall-clock NOW. Includes "måttligt" (1 mm/h) and "kraftigt" (5 mm/h) reference lines. Touch-scrubbable; the wall-clock-NOW divider separates past (Open-Meteo observations) from "PROGNOS" (Open-Meteo forecast).
 5. **Current intensity readout** — Big "X,X mm/t" at the top.
 6. **Rain warning** — Polls every 5 min and on every frame update, checks nowcast frames 0-20 min ahead. Shows in-app banner + fires a Web Push notification (via registered service worker) once permission is granted.
 7. **PWA install** — `manifest.webmanifest`, apple-touch-icon, `apple-mobile-web-app-capable`, service worker, custom iOS install hint modal.
