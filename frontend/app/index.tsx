@@ -101,6 +101,7 @@ export default function Regnradar() {
   const [intensities, setIntensities] = useState<(number | null)[]>([]);
   // Open-Meteo 15-min precipitation forecast — authoritative intensity source
   const [precip, setPrecip] = useState<{ time: number; mmh: number }[]>([]);
+  const [precipError, setPrecipError] = useState<string | null>(null);
   const [graphOpen, setGraphOpen] = useState(true);
   const [warning, setWarning] = useState<{ minutes: number; mmh: number } | null>(null);
   const [pushPermission, setPushPermission] = useState<NotificationPermission>("default");
@@ -402,18 +403,20 @@ export default function Regnradar() {
     const { lat, lng } = coords;
 
     const fetchPrecip = async () => {
+      // Abort-controlled 8-second timeout so a hung fetch never blocks the UI.
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
       try {
         const url =
           `https://api.open-meteo.com/v1/forecast?` +
           `latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
           `&minutely_15=precipitation&past_hours=3&forecast_hours=2&timezone=auto`;
-        const r = await fetch(url, { cache: "no-store" });
+        const r = await fetch(url, { cache: "no-store", signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         const times: string[] = data?.minutely_15?.time || [];
         const values: (number | null)[] = data?.minutely_15?.precipitation || [];
-        // Open-Meteo returns naive local-time strings ("2026-02-18T15:30") in the
-        // location's timezone. Parse as UTC then subtract utc_offset_seconds to
-        // get the true UTC moment. Comparable to RainViewer's UTC frame stamps.
         const utcOffset = Number(data?.utc_offset_seconds || 0);
         const nowS = Date.now() / 1000;
         const parsed = times
@@ -424,35 +427,28 @@ export default function Regnradar() {
           })
           .filter((p) => p.time >= nowS - 3 * 3600 && p.time <= nowS + 3 * 3600);
 
-        // Debug: log raw times vs device time to verify alignment (user requested)
         if (typeof console !== "undefined") {
-          const nowDev = new Date();
-          const sample = times.slice(0, 3).concat(times.slice(-2));
           // eslint-disable-next-line no-console
           console.log(
-            "[Regnradar] Open-Meteo tz=" +
-              data?.timezone +
-              " offset=" + utcOffset + "s" +
-              " device(UTC)=" + nowDev.toISOString() +
-              " device(local)=" + nowDev.toString().slice(0, 25) +
-              " sample raw times=" + JSON.stringify(sample) +
-              " parsed.length=" + parsed.length
+            "[Regnradar] Open-Meteo OK tz=" + data?.timezone +
+              " offset=" + utcOffset + "s parsed=" + parsed.length
           );
-          if (parsed.length) {
-            const nearest = parsed.reduce((best, p) =>
-              Math.abs(p.time - nowS) < Math.abs(best.time - nowS) ? p : best
-            );
-            // eslint-disable-next-line no-console
-            console.log(
-              "[Regnradar] Nearest precip to now: mmh=" + nearest.mmh.toFixed(2) +
-                " at " + new Date(nearest.time * 1000).toISOString()
-            );
-          }
         }
-
-        if (!cancelled) setPrecip(parsed);
-      } catch (e) {
-        console.warn("Open-Meteo fetch failed", e);
+        if (!cancelled) {
+          setPrecip(parsed);
+          setPrecipError(null);
+        }
+      } catch (e: any) {
+        clearTimeout(timeoutId);
+        const msg = e?.name === "AbortError" ? "timeout (8s)" : (e?.message || String(e));
+        // eslint-disable-next-line no-console
+        console.warn("[Regnradar] Open-Meteo fetch failed:", msg);
+        if (!cancelled) {
+          // Fall back to radar-only by leaving precip empty + flagging the error
+          // so the UI can show a discreet inline notice instead of hanging.
+          setPrecip([]);
+          setPrecipError(msg);
+        }
       }
     };
 
@@ -953,6 +949,7 @@ export default function Regnradar() {
               frames={frames}
               intensities={intensities}
               precip={precip}
+              precipError={precipError}
               currentIdx={currentIdx}
               onScrub={(idx, isFinal) => {
                 if (scrubResumeRef.current) {
@@ -1179,12 +1176,14 @@ function RainGraph({
   frames,
   intensities,
   precip,
+  precipError,
   currentIdx,
   onScrub,
 }: {
   frames: any[];
   intensities: (number | null)[];
   precip: { time: number; mmh: number }[];
+  precipError?: string | null;
   currentIdx: number;
   onScrub?: (idx: number, isFinal: boolean) => void;
 }) {
@@ -1259,10 +1258,30 @@ function RainGraph({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [combined]);
 
-  if (!frames.length) {
+  // Empty state: only block rendering when we have nothing at all to show.
+  // Once either radar intensities OR Open-Meteo precip is in, we render with
+  // whatever is available — radar-only is a perfectly valid graph.
+  const hasAnyData = combined.length > 0;
+  if (!hasAnyData) {
     return (
-      <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", color: MUTED, fontSize: 12 }}>
-        Hämtar data…
+      <div
+        style={{
+          height: 160,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          color: MUTED,
+          fontSize: 12,
+          gap: 4,
+        }}
+      >
+        <span>{precipError ? "Kunde inte hämta prognos" : "Hämtar data…"}</span>
+        {precipError && (
+          <span style={{ fontSize: 10, opacity: 0.7 }}>
+            {precipError} · försöker igen
+          </span>
+        )}
       </div>
     );
   }
