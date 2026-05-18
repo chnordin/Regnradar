@@ -99,6 +99,8 @@ export default function Regnradar() {
   const scrubResumeRef = useRef<number | null>(null);
 
   const [intensities, setIntensities] = useState<(number | null)[]>([]);
+  // Open-Meteo 15-min precipitation forecast — authoritative intensity source
+  const [precip, setPrecip] = useState<{ time: number; mmh: number }[]>([]);
   const [graphOpen, setGraphOpen] = useState(true);
   const [warning, setWarning] = useState<{ minutes: number; mmh: number } | null>(null);
   const [pushPermission, setPushPermission] = useState<NotificationPermission>("default");
@@ -393,90 +395,77 @@ export default function Regnradar() {
     return () => clearInterval(playTimerRef.current);
   }, [playing, frames.length]);
 
-  // ─── Sample radar intensity at user position for every frame ────────────────
+  // ─── Fetch precipitation forecast from Open-Meteo (every 15 min) ────────────
   useEffect(() => {
-    if (!coords || !frames.length) return;
+    if (!coords) return;
     let cancelled = false;
     const { lat, lng } = coords;
-    const { tileX, tileY, px, py } = latLngToTilePx(lat, lng, SAMPLE_ZOOM, 256);
-    const sample = async (frame: typeof frames[number]) => {
-      // Use 256px tiles for sampling (smaller)
-      const url = `${frame.host}${frame.path}/256/${SAMPLE_ZOOM}/${tileX}/${tileY}/2/1_1.png`;
-      return new Promise<number | null>((resolve) => {
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        img.onload = () => {
-          try {
-            const cvs = sampleCanvasRef.current || document.createElement("canvas");
-            sampleCanvasRef.current = cvs;
-            cvs.width = 256;
-            cvs.height = 256;
-            const ctx = cvs.getContext("2d");
-            if (!ctx) return resolve(null);
-            ctx.clearRect(0, 0, 256, 256);
-            ctx.drawImage(img, 0, 0);
-            // Sample a 3x3 area and average
-            let sumMmh = 0;
-            let count = 0;
-            for (let dy = -1; dy <= 1; dy++) {
-              for (let dx = -1; dx <= 1; dx++) {
-                const x = Math.max(0, Math.min(255, px + dx));
-                const y = Math.max(0, Math.min(255, py + dy));
-                const d = ctx.getImageData(x, y, 1, 1).data;
-                const dbz = rgbToDbz(d[0], d[1], d[2], d[3]);
-                sumMmh += dbzToMmh(dbz);
-                count++;
-              }
-            }
-            resolve(count ? sumMmh / count : 0);
-          } catch (e) {
-            resolve(null);
-          }
-        };
-        img.onerror = () => resolve(null);
-        img.src = url;
-      });
+
+    const fetchPrecip = async () => {
+      try {
+        const url =
+          `https://api.open-meteo.com/v1/forecast?` +
+          `latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
+          `&minutely_15=precipitation&past_hours=3&forecast_hours=2&timezone=auto`;
+        const r = await fetch(url, { cache: "no-store" });
+        const data = await r.json();
+        const times: string[] = data?.minutely_15?.time || [];
+        const values: (number | null)[] = data?.minutely_15?.precipitation || [];
+        // Open-Meteo returns naive local-time strings ("2026-02-18T15:30") in the
+        // location's timezone. Parse as UTC then subtract utc_offset_seconds to
+        // get the true UTC moment. This makes precip.time directly comparable
+        // to the RainViewer frame timestamps (UNIX seconds, UTC).
+        const utcOffset = Number(data?.utc_offset_seconds || 0);
+        const nowS = Date.now() / 1000;
+        const parsed = times
+          .map((t, i) => {
+            const ts = Math.floor(new Date(t + "Z").getTime() / 1000) - utcOffset;
+            const mm15 = values[i] ?? 0;
+            return { time: ts, mmh: Math.max(0, mm15 * 4) };
+          })
+          // Keep a generous window around "now" (-3h ↔ +3h) — radar timeline fits inside.
+          .filter((p) => p.time >= nowS - 3 * 3600 && p.time <= nowS + 3 * 3600);
+        if (!cancelled) setPrecip(parsed);
+      } catch (e) {
+        console.warn("Open-Meteo fetch failed", e);
+      }
     };
 
-    (async () => {
-      const out: (number | null)[] = new Array(frames.length).fill(null);
-      // Sample sequentially to keep things smooth
-      for (let i = 0; i < frames.length; i++) {
-        if (cancelled) return;
-        out[i] = await sample(frames[i]);
-        // Progressive update
-        if (!cancelled) setIntensities([...out]);
-      }
-    })();
-
+    fetchPrecip();
+    const id = setInterval(fetchPrecip, 15 * 60 * 1000); // refresh every 15 min
     return () => {
       cancelled = true;
+      clearInterval(id);
     };
-  }, [coords?.lat, coords?.lng, frames]);
+  }, [coords?.lat, coords?.lng]);
 
-  // ─── Rain warning check (every 5 min + on intensity update) ────────────────
+  // (Legacy pixel-sampling kept disabled — Open-Meteo is the authoritative source now.)
+
+  // ─── Rain warning — uses Open-Meteo: any of next 2 quarters > 0.1 mm/h ──────
   useEffect(() => {
-    if (!frames.length || !intensities.length) return;
+    if (!precip.length) {
+      setWarning(null);
+      return;
+    }
     const now = Date.now() / 1000;
+    // Sort future entries by time, take the next two 15-min intervals.
+    const future = precip
+      .filter((p) => p.time > now)
+      .sort((a, b) => a.time - b.time)
+      .slice(0, 2);
     let foundMinutes: number | null = null;
     let foundMmh = 0;
-    for (let i = 0; i < frames.length; i++) {
-      const f = frames[i];
-      if (!f.isNowcast && f.time <= now) continue;
-      const dt = (f.time - now) / 60;
-      if (dt > 0 && dt <= 20) {
-        const mmh = intensities[i] ?? 0;
-        if (mmh >= 0.2) {
-          if (foundMinutes === null || dt < foundMinutes) {
-            foundMinutes = dt;
-            foundMmh = mmh;
-          }
+    for (const p of future) {
+      const dt = (p.time - now) / 60;
+      if (dt > 0 && dt <= 30 && p.mmh > 0.1) {
+        if (foundMinutes === null || dt < foundMinutes) {
+          foundMinutes = dt;
+          foundMmh = p.mmh;
         }
       }
     }
-    if (foundMinutes !== null) {
-      setWarning({ minutes: Math.round(foundMinutes), mmh: foundMmh });
-      // Trigger notification if granted
+    if (foundMinutes !== null && foundMinutes <= 30) {
+      setWarning({ minutes: Math.max(1, Math.round(foundMinutes)), mmh: foundMmh });
       if (typeof window !== "undefined" && Notification.permission === "granted") {
         const lastSent = Number(sessionStorage.getItem("rr_last_warn") || "0");
         if (Date.now() - lastSent > 5 * 60 * 1000) {
@@ -491,31 +480,27 @@ export default function Regnradar() {
     } else {
       setWarning(null);
     }
-  }, [frames, intensities]);
+  }, [precip]);
 
-  // ─── Current intensity (with moving average + smooth tween) ─────────────────
+  // ─── Current intensity — Open-Meteo entry matching the current radar frame ──
   const currentMmh = useMemo(() => {
-    if (!frames.length || !intensities.length) return 0;
-    const now = Date.now() / 1000;
-    let best = -1;
+    if (!precip.length) return 0;
+    // Use the time the user is "looking at" — current radar frame's time when
+    // animating/scrubbing, otherwise wall-clock.
+    const refTime =
+      frames.length && frames[currentIdx] ? frames[currentIdx].time : Date.now() / 1000;
+    // Pick the most recent 15-min interval whose start is at or before refTime.
+    let bestIdx = -1;
     let bestDt = Infinity;
-    for (let i = 0; i < frames.length; i++) {
-      if (frames[i].isNowcast) continue;
-      const dt = Math.abs(frames[i].time - now);
+    for (let i = 0; i < precip.length; i++) {
+      const dt = Math.abs(precip[i].time - refTime);
       if (dt < bestDt) {
         bestDt = dt;
-        best = i;
+        bestIdx = i;
       }
     }
-    // 3-frame moving average centred on the "current" past frame to dampen jitter
-    const window: number[] = [];
-    for (let i = Math.max(0, best - 1); i <= Math.min(frames.length - 1, best + 1); i++) {
-      const v = intensities[i];
-      if (v != null) window.push(v);
-    }
-    if (!window.length) return intensities[best] ?? 0;
-    return window.reduce((a, b) => a + b, 0) / window.length;
-  }, [frames, intensities]);
+    return bestIdx >= 0 ? precip[bestIdx].mmh : 0;
+  }, [precip, frames, currentIdx]);
 
   // Tween the displayed mm/h value smoothly when target changes
   const [displayedMmh, setDisplayedMmh] = useState(0);
@@ -884,7 +869,7 @@ export default function Regnradar() {
           <div data-testid="rain-graph" style={{ padding: "0 12px 12px" }}>
             <RainGraph
               frames={frames}
-              intensities={intensities}
+              precip={precip}
               currentIdx={currentIdx}
               onScrub={(idx, isFinal) => {
                 if (scrubResumeRef.current) {
@@ -892,11 +877,9 @@ export default function Regnradar() {
                   scrubResumeRef.current = null;
                 }
                 if (!isFinal) {
-                  // Active scrubbing — pause and jump
                   setPlaying(false);
                   setCurrentIdx(idx);
                 } else {
-                  // Touch released — schedule resume after 3s of inactivity
                   scrubResumeRef.current = setTimeout(() => {
                     setPlaying(true);
                     scrubResumeRef.current = null;
@@ -1111,12 +1094,12 @@ function Timeline({
 
 function RainGraph({
   frames,
-  intensities,
+  precip,
   currentIdx,
   onScrub,
 }: {
   frames: any[];
-  intensities: (number | null)[];
+  precip: { time: number; mmh: number }[];
   currentIdx: number;
   onScrub?: (idx: number, isFinal: boolean) => void;
 }) {
@@ -1124,38 +1107,39 @@ function RainGraph({
   const scrubbingRef = useRef(false);
   const tweenRafRef = useRef<number | null>(null);
 
-  // ── Animated displayed intensities ─────────────────────────────────────────
-  // Tween from the previous displayed values to the new `intensities` over 500ms.
-  const [displayed, setDisplayed] = useState<(number | null)[]>(intensities);
-  const fromRef = useRef<(number | null)[]>(intensities);
-  const targetRef = useRef<(number | null)[]>(intensities);
+  // ── Animated displayed precipitation values ─────────────────────────────────
+  // Tween from previous to new precip mmh values over 500ms (ease-in-out cubic).
+  // Keyed by time so we can match values across refreshes even if the array
+  // shifts as the 15-min window rolls forward.
+  const [displayed, setDisplayed] = useState<{ time: number; mmh: number }[]>(precip);
+  const fromRef = useRef<{ time: number; mmh: number }[]>(precip);
 
   useEffect(() => {
-    // Update target. Start a new tween from current displayed values.
-    targetRef.current = intensities;
-    // If lengths differ, reset immediately (different frame count = different x-axis)
-    if (displayed.length !== intensities.length) {
-      fromRef.current = intensities;
-      setDisplayed(intensities);
+    // If lengths or time-keys differ, snap to the new array (no morph between
+    // structurally different sets — but values within will still tween via the
+    // smooth path between refreshes).
+    const sameLen = displayed.length === precip.length;
+    const sameKeys =
+      sameLen && displayed.every((d, i) => d.time === precip[i].time);
+    if (!sameKeys) {
+      fromRef.current = precip;
+      setDisplayed(precip);
       return;
     }
-    // Snapshot current displayed as the new "from"
-    fromRef.current = [...displayed];
+    // Snapshot current displayed as the new "from" and tween mmh values.
+    fromRef.current = displayed.map((d) => ({ ...d }));
     if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
     const dur = 500;
     const t0 = performance.now();
-    // ease-in-out cubic
     const ease = (t: number) =>
       t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
     const tick = (now: number) => {
       const p = Math.min(1, (now - t0) / dur);
       const e = ease(p);
-      const out: (number | null)[] = intensities.map((tgt, i) => {
+      const out = precip.map((tgt, i) => {
         const src = fromRef.current[i];
-        if (tgt == null && src == null) return null;
-        if (tgt == null) return src; // keep previous if new is null (still loading)
-        if (src == null) return tgt * e; // grow from 0 to target
-        return src + (tgt - src) * e;
+        if (!src) return tgt;
+        return { time: tgt.time, mmh: src.mmh + (tgt.mmh - src.mmh) * e };
       });
       setDisplayed(out);
       if (p < 1) tweenRafRef.current = requestAnimationFrame(tick);
@@ -1166,7 +1150,7 @@ function RainGraph({
       if (tweenRafRef.current) cancelAnimationFrame(tweenRafRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intensities]);
+  }, [precip]);
 
   if (!frames.length) {
     return (
@@ -1186,22 +1170,27 @@ function RainGraph({
   const innerW = W - PAD_LEFT - PAD_RIGHT;
   const innerH = H - PAD_TOP - PAD_BOTTOM;
 
-  const maxMmh = Math.max(5.5, ...displayed.map((v) => v ?? 0), ...intensities.map((v) => v ?? 0));
-  const xFor = (i: number) =>
-    PAD_LEFT + (frames.length === 1 ? innerW / 2 : (i / (frames.length - 1)) * innerW);
+  // ── Time-based X axis: span the radar timeline window ──────────────────────
+  const tMin = frames[0].time;
+  const tMax = frames[frames.length - 1].time;
+  const xForTime = (t: number) =>
+    PAD_LEFT + ((t - tMin) / Math.max(1, tMax - tMin)) * innerW;
+
+  const maxMmh = Math.max(
+    5.5,
+    ...displayed.map((p) => p.mmh),
+    ...precip.map((p) => p.mmh)
+  );
   const yFor = (v: number) => PAD_TOP + (1 - v / maxMmh) * innerH;
 
-  // Build smooth path via monotone cubic interpolation (Catmull-Rom-ish)
-  // Skip null intensities — anchor the curve to the previous valid point.
-  type P = { x: number; y: number; v: number };
-  const points: P[] = [];
-  for (let i = 0; i < frames.length; i++) {
-    const v = displayed[i];
-    if (v == null) continue;
-    points.push({ x: xFor(i), y: yFor(Math.max(0, v)), v });
-  }
+  // Build smooth path through precipitation points (sorted, clipped to range)
+  type P = { x: number; y: number };
+  const points: P[] = displayed
+    .filter((p) => p.time >= tMin - 600 && p.time <= tMax + 600)
+    .sort((a, b) => a.time - b.time)
+    .map((p) => ({ x: xForTime(p.time), y: yFor(Math.max(0, p.mmh)) }));
 
-  // Cardinal spline path (smooth) — uses tension 0.5
+  // Cardinal spline path (smooth) — tension 0.5, with Y-clamping safety
   function buildPath(pts: P[], close: boolean) {
     if (pts.length === 0) return "";
     if (pts.length === 1) {
@@ -1219,13 +1208,11 @@ function RainGraph({
       const p1 = pts[i];
       const p2 = pts[i + 1];
       const p3 = pts[i + 2] || p2;
-      // Catmull-Rom to Bézier with tension = 0.5
       const t = 0.5;
       const cp1x = p1.x + ((p2.x - p0.x) / 6) * t * 2;
       let cp1y = p1.y + ((p2.y - p0.y) / 6) * t * 2;
       const cp2x = p2.x - ((p3.x - p1.x) / 6) * t * 2;
       let cp2y = p2.y - ((p3.y - p1.y) / 6) * t * 2;
-      // Clamp control-point Y so the curve never overshoots above ceiling or below baseline
       cp1y = clampY(cp1y);
       cp2y = clampY(cp2y);
       d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
@@ -1242,15 +1229,32 @@ function RainGraph({
   const fillPath = buildPath(points, true);
 
   // Locate where the nowcast (future) section begins — to lighten that area
-  const nowcastStartIdx = frames.findIndex((f) => f.isNowcast);
-  const nowcastX = nowcastStartIdx > 0 ? xFor(nowcastStartIdx) : null;
+  const nowcastStartIdx = frames.findIndex((f: any) => f.isNowcast);
+  const nowcastX = nowcastStartIdx > 0 ? xForTime(frames[nowcastStartIdx].time) : null;
 
-  // Current frame marker
-  const curX = xFor(currentIdx);
-  const curV = displayed[currentIdx];
-  const curY = curV != null ? yFor(Math.max(0, curV)) : null;
+  // ── Current frame marker — positioned by the current radar frame's time ────
+  const curT = frames[currentIdx]?.time ?? tMin;
+  const curX = xForTime(curT);
+  // Interpolate the curve's Y at the marker's X for a nice circle on the path
+  let curY: number | null = null;
+  if (points.length >= 2) {
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      if (curX >= a.x && curX <= b.x) {
+        const r = (curX - a.x) / Math.max(1e-6, b.x - a.x);
+        curY = a.y + (b.y - a.y) * r;
+        break;
+      }
+    }
+    if (curY === null) {
+      curY = curX <= points[0].x ? points[0].y : points[points.length - 1].y;
+    }
+  } else if (points.length === 1) {
+    curY = points[0].y;
+  }
 
-  // X-axis labels
+  // X-axis labels — pick a few evenly spaced frame times for context
   const labelEvery = Math.max(1, Math.floor(frames.length / 6));
 
   const refs = [
@@ -1258,9 +1262,8 @@ function RainGraph({
     { label: "måttligt", value: 1 },
   ];
 
-  // For HTML overlay positioning, express y-positions as percentages of total SVG height
   const yPct = (v: number) => ((PAD_TOP + (1 - v / maxMmh) * innerH) / H) * 100;
-  const xPct = (i: number) => (xFor(i) / W) * 100;
+  const xPctTime = (t: number) => (xForTime(t) / W) * 100;
 
   // ── Scrubbing: compute frame index from a touch/mouse X position ───────────
   const indexFromClientX = (clientX: number): number => {
@@ -1465,8 +1468,8 @@ function RainGraph({
             </div>
           );
         })}
-        {/* X-axis time labels */}
-        {frames.map((f, i) => {
+        {/* X-axis time labels — position by frame time on the new time axis */}
+        {frames.map((f: any, i: number) => {
           if (i % labelEvery !== 0) return null;
           const active = i === currentIdx;
           return (
@@ -1474,7 +1477,7 @@ function RainGraph({
               key={"xt_" + f.time + "_" + i}
               style={{
                 position: "absolute",
-                left: `${xPct(i)}%`,
+                left: `${xPctTime(f.time)}%`,
                 transform: "translateX(-50%)",
                 bottom: 0,
                 fontSize: 11,
