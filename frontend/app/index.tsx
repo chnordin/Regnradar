@@ -538,21 +538,25 @@ export default function Regnradar() {
       setRadarFrameIdx(0);
     }
   }, [frames.length]);
+  // ─── Animation loop ─────────────────────────────────────────────────────────
+  // The interval runs from mount and is ONLY recreated when `playing` toggles.
+  // It never depends on `slots.length` or `frames.length` — those are read
+  // from refs inside the tick callback. This guarantees the loop is not
+  // killed by every 30 s `nowTick` re-render or 5-min frame refresh.
   useEffect(() => {
-    if (!playing || !slots.length) return;
-    playTimerRef.current = setInterval(() => {
+    if (!playing) return;
+    const tick = () => {
+      // Advance graph-marker slot index
       setCurrentIdx((i) => {
-        const newIdx = (i + 1) % slotsLengthRef.current;
+        const n = slotsLengthRef.current;
+        if (n <= 0) return i;
+        const newIdx = (i + 1) % n;
         setMarkerToSlotIdx(newIdx);
         return newIdx;
       });
-      // Radar frame advances independently. With only 2-6 frames available,
-      // a naive (i+1) % n cycle would feel like back-and-forth motion: e.g.
-      // with 2 frames T1 (older) and T2 (newer), the loop 0→1→0→1 visually
-      // reads as "forward, BACKWARD, forward, BACKWARD". To prevent that
-      // perceived reversal, we hold the last frame for ONE extra tick before
-      // wrapping back to frame 0, so the user perceives a brief pause and
-      // restart instead of a backward step.
+      // Advance radar frame index with a wrap-hold so a 2-frame loop doesn't
+      // feel like back-and-forth motion (forward, BACKWARD, forward, BACKWARD).
+      // We hold the last frame for one extra tick before resetting to 0.
       setRadarFrameIdx((i) => {
         const n = framesLengthRef.current;
         if (n <= 0) return 0;
@@ -567,9 +571,15 @@ export default function Regnradar() {
         }
         return i + 1;
       });
-    }, 800);
-    return () => clearInterval(playTimerRef.current);
-  }, [playing, slots.length]);
+    };
+    playTimerRef.current = setInterval(tick, 800);
+    return () => {
+      if (playTimerRef.current) {
+        clearInterval(playTimerRef.current);
+        playTimerRef.current = null;
+      }
+    };
+  }, [playing]);
 
   // ─── On first slot load, seek to the "now" slot so the user starts at the
   //     present moment of the timeline (not the leftmost past slot). ─────────
