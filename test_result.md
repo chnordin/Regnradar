@@ -120,6 +120,22 @@ frontend:
         agent: "main"
         comment: "ROOT CAUSE FOUND: Previous agent left `// @ts-nocheck` at top while leaving critical state/refs undeclared: radarFrameIdx, setRadarFrameIdx, currentRadarIdxRef, currentFramesRef, framesLengthRef, slotsLengthRef, setMarkerToSlotIdx. Component was crashing on iPhone Safari (no Metro HMR safety net). RESTORED all declarations + replaced create-and-destroy tile pattern with lazy-create + opacity-swap (prevents RainViewer rate-limit 429s). TypeScript strict check now passes with 0 errors. Verified locally: animation cycles 0->12 smoothly via screenshot_tool, distinct radar frames render."
 
+  - task: "Remove debug overlay + sync graph marker with radar animation"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: false
+        agent: "user"
+        comment: "Two issues: (1) black debug overlay still visible in top-left corner; (2) graph marker stuck at 'now' position (~11:15/15:00) instead of following the currently displayed radar frame's time."
+      - working: true
+        agent: "main"
+        comment: "Removed the debug-counter <div> overlay entirely + removed the per-tick console.log. Made graph marker time-driven: (a) added `activeFrameTime` prop to RainGraph; (b) `initialMarkerX` now interpolates linearly between slots[0].time and slots[n-1].time based on the active radar frame's time; (c) currentIdx is now derived (useMemo) from the slot nearest to the radar frame's time, so the active-bar highlight + top mm/h readout also sync with the radar; (d) step() handler updates radarFrameIdx instead of dead currentIdx state. Verified visually: 4 distinct marker x positions over 14 ticks (interpolated between slots, not snapping)."
+
 agent_communication:
   - agent: "main"
-    message: "P0 radar animation crash fixed by restoring missing variable declarations in /app/frontend/app/index.tsx. The Vercel iPhone deploy was crashing silently because Metro HMR had cached a working bundle locally, hiding the truth. SW cache bumped to v3 so iPhone PWA will pull fresh bundle on next refresh. Debug overlay still present in top-left for user verification - can remove once confirmed working on iPhone."
+    message: "Both user-requested fixes implemented. Debug overlay gone. Graph marker now interpolates smoothly between slot positions based on the actual time of the currently-displayed radar frame. Note: marker will only traverse the LEFT half of the chart (≈now-1h to now+30min) because RainViewer's radar coverage is limited to that range, while the chart extends to now+2h (Open-Meteo forecast)."
+

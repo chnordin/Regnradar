@@ -110,7 +110,6 @@ export default function Regnradar() {
   const [frames, setFrames] = useState<
     { time: number; path: string; host: string; isNowcast: boolean }[]
   >([]);
-  const [currentIdx, setCurrentIdx] = useState(0);
   // ─── Radar frame index ─────────────────────────────────────────────────────
   // ONE setInterval below drives this index. Every tick:
   //   1) increment `radarFrameIdx`
@@ -137,6 +136,10 @@ export default function Regnradar() {
   const currentRadarIdxRef = useRef(0);
   const framesLengthRef = useRef(0);
   const slotsLengthRef = useRef(0);
+  // slotsRef holds the latest slots array so the animation interval can map a
+  // radar-frame time → graph X coordinate without re-running the interval on
+  // every `slots` re-render.
+  const slotsRef = useRef<{ time: number; mmh: number; isFuture: boolean }[]>([]);
   currentFramesRef.current = frames;
   currentRadarIdxRef.current = radarFrameIdx;
   // ─── Pre-loaded radar tileLayers, keyed by frame path ──────────────────────
@@ -150,6 +153,27 @@ export default function Regnradar() {
     const n = slotsLengthRef.current;
     if (n <= 0) return;
     const x = graphXForIdx(idx, n);
+    if (markerLineRef.current && isFinite(x)) {
+      markerLineRef.current.setAttribute("x1", String(x));
+      markerLineRef.current.setAttribute("x2", String(x));
+    }
+  };
+  // Move the graph marker to the X position for an absolute time (UNIX sec).
+  // The marker should follow the actual time of the currently displayed radar
+  // frame — NOT a fixed "now" position — so the user sees graph + map sync.
+  // Linearly interpolates between slots[0].time and slots[n-1].time, clamping
+  // X to the graph's inner bounds so the marker never escapes the chart area.
+  const setMarkerToTime = (timeS: number) => {
+    const s = slotsRef.current;
+    const n = s.length;
+    if (n <= 1) return;
+    const t0 = s[0].time;
+    const t1 = s[n - 1].time;
+    if (!isFinite(timeS) || t1 <= t0) return;
+    let frac = (timeS - t0) / (t1 - t0);
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
+    const x = GRAPH_PAD_LEFT + frac * GRAPH_INNER_W;
     if (markerLineRef.current && isFinite(x)) {
       markerLineRef.current.setAttribute("x1", String(x));
       markerLineRef.current.setAttribute("x2", String(x));
@@ -201,6 +225,24 @@ export default function Regnradar() {
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [precip, nowTick]);
+  // currentIdx = slot index nearest in time to the currently-displayed radar
+  // frame. Derived (not state) so it auto-syncs whenever the radar animation
+  // advances. Used for the active-bar highlight in the chart and for the top
+  // "current intensity" readout.
+  const currentIdx = useMemo(() => {
+    const f = frames[radarFrameIdx];
+    if (!f || !slots.length) return 0;
+    let bestIdx = 0;
+    let bestDt = Infinity;
+    for (let i = 0; i < slots.length; i++) {
+      const dt = Math.abs(slots[i].time - f.time);
+      if (dt < bestDt) {
+        bestDt = dt;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }, [frames, radarFrameIdx, slots]);
   // intensities (per radar-frame) is no longer used for bars, but kept for any
   // legacy consumers (currently none). Bars come from `slots` above.
   const intensities = useMemo<(number | null)[]>(
@@ -454,7 +496,12 @@ export default function Regnradar() {
   // or RAF for the marker position.
   useEffect(() => {
     slotsLengthRef.current = slots.length;
-  }, [slots.length]);
+    slotsRef.current = slots;
+    // Whenever slots are regenerated (every 30s "now tick") the timeline
+    // shifts, so re-position the marker for the current radar frame.
+    const f = currentFramesRef.current[currentRadarIdxRef.current];
+    if (f) setMarkerToTime(f.time);
+  }, [slots]);
   useEffect(() => {
     framesLengthRef.current = frames.length;
     // Clamp radarFrameIdx whenever frames update so we don't index past end.
@@ -472,26 +519,6 @@ export default function Regnradar() {
   useEffect(() => {
     if (!playing) return;
     const tick = () => {
-      // ── DEBUG: emit each tick so we can see in the console whether the
-      //    interval is alive and which radar frame is being shown. ──────────
-      try {
-        const n = framesLengthRef.current;
-        const i = currentRadarIdxRef.current;
-        const f = currentFramesRef.current[i];
-        const url = f ? `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png` : "(no frame)";
-        // eslint-disable-next-line no-console
-        console.log(
-          `[regnradar] tick idx=${i}/${Math.max(0, n - 1)} (n=${n}) url=${url}`
-        );
-      } catch {}
-      // Advance graph-marker slot index
-      setCurrentIdx((i) => {
-        const n = slotsLengthRef.current;
-        if (n <= 0) return i;
-        const newIdx = (i + 1) % n;
-        setMarkerToSlotIdx(newIdx);
-        return newIdx;
-      });
       // Advance radar frame: simple (i+1) % n. With many frames now fetched
       // (full RainViewer past + nowcast) this gives a clean forward loop.
       setRadarFrameIdx((i) => {
@@ -499,6 +526,11 @@ export default function Regnradar() {
         if (n <= 0) return 0;
         const next = (i + 1) % n;
         currentRadarIdxRef.current = next;
+        // Move the graph marker to the X position for THIS radar frame's
+        // actual time, so the dashed line on the chart always corresponds to
+        // the moment of weather being displayed on the map.
+        const f = currentFramesRef.current[next];
+        if (f) setMarkerToTime(f.time);
         return next;
       });
     };
@@ -511,24 +543,14 @@ export default function Regnradar() {
     };
   }, [playing]);
 
-  // ─── On first slot load, seek to the "now" slot so the user starts at the
-  //     present moment of the timeline (not the leftmost past slot). ─────────
+  // ─── On first slot load, position the marker at the active radar frame's
+  //     time (no more separate "now" seek — marker follows radar). ───────────
   useEffect(() => {
     if (!firstFetchRef.current) return;
     if (!slots.length) return;
     firstFetchRef.current = false;
-    const nowS = Date.now() / 1000;
-    let bestIdx = 0;
-    let bestDt = Infinity;
-    for (let i = 0; i < slots.length; i++) {
-      const dt = Math.abs(slots[i].time - nowS);
-      if (dt < bestDt) {
-        bestDt = dt;
-        bestIdx = i;
-      }
-    }
-    setCurrentIdx(bestIdx);
-    setMarkerToSlotIdx(bestIdx);
+    const f = currentFramesRef.current[currentRadarIdxRef.current];
+    if (f) setMarkerToTime(f.time);
   }, [slots.length]);
 
   // ─── Fetch precipitation forecast from Open-Meteo (every 15 min) ────────────
@@ -682,7 +704,15 @@ export default function Regnradar() {
   const togglePlay = () => setPlaying((p) => !p);
   const step = (dir: number) => {
     setPlaying(false);
-    setCurrentIdx((i) => (i + dir + frames.length) % frames.length);
+    setRadarFrameIdx((i) => {
+      const n = framesLengthRef.current;
+      if (n <= 0) return 0;
+      const next = (i + dir + n) % n;
+      currentRadarIdxRef.current = next;
+      const f = currentFramesRef.current[next];
+      if (f) setMarkerToTime(f.time);
+      return next;
+    });
   };
 
   const requestPushPermission = async () => {
@@ -910,35 +940,6 @@ export default function Regnradar() {
       {/* Map */}
       <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
         <div ref={mapEl} data-testid="map-container" style={{ position: "absolute", inset: 0 }} />
-        {/* ── DEBUG counter overlay (top-left). Shows radarFrameIdx / total
-            and the last 24 chars of the active radar URL. Updates on every
-            React re-render = every tick (since setRadarFrameIdx is called). */}
-        <div
-          data-testid="debug-counter"
-          style={{
-            position: "absolute",
-            top: 6,
-            left: 6,
-            zIndex: 1200,
-            background: "rgba(15,23,42,0.85)",
-            color: "#fff",
-            fontFamily: "monospace",
-            fontSize: 11,
-            padding: "4px 8px",
-            borderRadius: 6,
-            pointerEvents: "none",
-            maxWidth: "60%",
-            lineHeight: 1.3,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-          }}
-        >
-          {`idx=${radarFrameIdx} / ${frames.length}\n${
-            frames[radarFrameIdx]
-              ? frames[radarFrameIdx].path.slice(-30)
-              : "(no frame)"
-          }`}
-        </div>
         {/* Geo error overlay */}
         {geoError && (
           <div
@@ -1030,6 +1031,7 @@ export default function Regnradar() {
               slots={slots}
               precipError={precipError}
               currentIdx={currentIdx}
+              activeFrameTime={frames[radarFrameIdx]?.time ?? null}
               markerLineRef={markerLineRef}
             />
           </div>
@@ -1256,11 +1258,13 @@ function RainGraph({
   slots,
   precipError,
   currentIdx,
+  activeFrameTime,
   markerLineRef,
 }: {
   slots: { time: number; mmh: number; isFuture: boolean }[];
   precipError?: string | null;
   currentIdx: number;
+  activeFrameTime?: number | null;
   markerLineRef?: React.MutableRefObject<SVGLineElement | null>;
 }) {
   // 30-second tick so labels/now-line refresh as wall-clock time advances.
@@ -1349,9 +1353,25 @@ function RainGraph({
   const linePath = buildPath(points, false);
   const fillPath = buildPath(points, true);
 
-  // Initial marker X — subsequent updates come from the parent's setInterval
-  // via setAttribute on the ref. No React state, no RAF, no tween.
-  const initialMarkerX = graphXForIdx(currentIdx, slots.length);
+  // Initial marker X — computed from the currently-displayed radar frame's
+  // TIME so the dashed line on the chart always corresponds to the moment of
+  // weather shown on the map. Falls back to the slot-index position when no
+  // frame is yet available.
+  let initialMarkerX = graphXForIdx(currentIdx, slots.length);
+  if (
+    activeFrameTime != null &&
+    isFinite(activeFrameTime) &&
+    slots.length > 1
+  ) {
+    const t0 = slots[0].time;
+    const t1 = slots[slots.length - 1].time;
+    if (t1 > t0) {
+      let frac = (activeFrameTime - t0) / (t1 - t0);
+      if (frac < 0) frac = 0;
+      if (frac > 1) frac = 1;
+      initialMarkerX = GRAPH_PAD_LEFT + frac * GRAPH_INNER_W;
+    }
+  }
 
   // Reference lines that fit in the current Y range
   const allRefs = [
@@ -1428,8 +1448,11 @@ function RainGraph({
           strokeLinecap="round"
         />
 
-        {/* Active frame marker — vertical dashed line. The parent's animation
-            setInterval updates `x1`/`x2` via setAttribute on every tick. */}
+        {/* Active frame marker — vertical dashed line. x1/x2 are driven by
+            React via `initialMarkerX` (time-based) so the marker re-renders
+            in sync with the radar animation on every tick. The ref + extra
+            setAttribute is a safety net for any environment where the React
+            attr update lags (e.g. legacy iOS Safari). */}
         <line
           ref={(el) => {
             if (markerLineRef) markerLineRef.current = el;
@@ -1438,6 +1461,8 @@ function RainGraph({
               el.setAttribute("x2", String(initialMarkerX));
             }
           }}
+          x1={initialMarkerX}
+          x2={initialMarkerX}
           y1={GRAPH_PAD_TOP}
           y2={GRAPH_H - GRAPH_PAD_BOTTOM}
           stroke={PRIMARY}
