@@ -119,6 +119,21 @@ export default function Regnradar() {
   // "now" on the initial load — subsequent refreshes preserve the running
   // animation index so the loop never resets mid-cycle.
   const firstFetchRef = useRef(true);
+  // ─── Graph marker DOM ref ─────────────────────────────────────────────────
+  // The active-frame marker on the area chart is a vertical <line> whose x1/x2
+  // are updated by direct setAttribute inside the existing animation
+  // setInterval below. No React state, no RAF, no tween for the marker.
+  const markerLineRef = useRef<SVGLineElement | null>(null);
+  const slotsLengthRef = useRef(0);
+  const setMarkerToSlotIdx = (idx: number) => {
+    const n = slotsLengthRef.current;
+    if (n <= 0) return;
+    const x = graphXForIdx(idx, n);
+    if (markerLineRef.current && isFinite(x)) {
+      markerLineRef.current.setAttribute("x1", String(x));
+      markerLineRef.current.setAttribute("x2", String(x));
+    }
+  };
 
   // ─── Derive per-frame intensities from Open-Meteo precip ───────────────────
   // For each radar frame, look up the nearest Open-Meteo `minutely_15`
@@ -476,10 +491,19 @@ export default function Regnradar() {
   // The animation cycles through `slots` (the 15-min Open-Meteo timeline),
   // not `frames` (which only spans the radar past+nowcast and can be very
   // short). Map tile rendering finds the nearest radar frame for each slot.
+  // The marker line is updated via direct DOM setAttribute — no React state
+  // or RAF for the marker position.
+  useEffect(() => {
+    slotsLengthRef.current = slots.length;
+  }, [slots.length]);
   useEffect(() => {
     if (!playing || !slots.length) return;
     playTimerRef.current = setInterval(() => {
-      setCurrentIdx((i) => (i + 1) % slots.length);
+      setCurrentIdx((i) => {
+        const newIdx = (i + 1) % slotsLengthRef.current;
+        setMarkerToSlotIdx(newIdx);
+        return newIdx;
+      });
     }, 400);
     return () => clearInterval(playTimerRef.current);
   }, [playing, slots.length]);
@@ -501,6 +525,7 @@ export default function Regnradar() {
       }
     }
     setCurrentIdx(bestIdx);
+    setMarkerToSlotIdx(bestIdx);
   }, [slots.length]);
 
   // ─── Fetch precipitation forecast from Open-Meteo (every 15 min) ────────────
@@ -973,6 +998,7 @@ export default function Regnradar() {
               slots={slots}
               precipError={precipError}
               currentIdx={currentIdx}
+              markerLineRef={markerLineRef}
             />
           </div>
         )}
@@ -1179,16 +1205,33 @@ function Timeline({
   );
 }
 
+// Layout constants for the area chart — module-level so the parent's
+// setInterval can compute marker X positions consistently.
+const GRAPH_W = 1000;
+const GRAPH_H = 160;
+const GRAPH_PAD_LEFT = 56;
+const GRAPH_PAD_RIGHT = 16;
+const GRAPH_PAD_TOP = 10;
+const GRAPH_PAD_BOTTOM = 22;
+const GRAPH_INNER_W = GRAPH_W - GRAPH_PAD_LEFT - GRAPH_PAD_RIGHT;
+const GRAPH_INNER_H = GRAPH_H - GRAPH_PAD_TOP - GRAPH_PAD_BOTTOM;
+function graphXForIdx(i: number, n: number): number {
+  if (n <= 1) return GRAPH_PAD_LEFT + GRAPH_INNER_W / 2;
+  return GRAPH_PAD_LEFT + (i / (n - 1)) * GRAPH_INNER_W;
+}
+
 function RainGraph({
   slots,
   precipError,
   currentIdx,
+  markerLineRef,
 }: {
   slots: { time: number; mmh: number; isFuture: boolean }[];
   precipError?: string | null;
   currentIdx: number;
+  markerLineRef?: React.MutableRefObject<SVGLineElement | null>;
 }) {
-  // 30-second tick so the wall-clock-relative bar styling refreshes smoothly.
+  // 30-second tick so labels/now-line refresh as wall-clock time advances.
   const [, setTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setTick((t) => t + 1), 30_000);
@@ -1199,7 +1242,7 @@ function RainGraph({
     return (
       <div
         style={{
-          height: 132,
+          height: 160,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
@@ -1219,16 +1262,66 @@ function RainGraph({
     );
   }
 
-  // ── Dynamic Y scale: peak * 1.25 with floor of 2.5 mm/h so the default
-  //    "Duggregn / Lätt regn / Måttligt" band is visible when there's no rain.
+  // Dynamic Y scale with sensible floor so the default reference band shows.
   const peak = Math.max(0, ...slots.map((s) => s.mmh));
   const maxMmh = Math.max(2.5, peak * 1.25);
-  const graphH = 120;
-  const yFor = (v: number) => (1 - v / maxMmh) * graphH;
-  const labelEvery = Math.max(1, Math.floor(slots.length / 6));
+  const yFor = (v: number) =>
+    GRAPH_PAD_TOP + (1 - Math.min(1, v / maxMmh)) * GRAPH_INNER_H;
 
-  // Intensity reference lines (mm/h). Shown only when they fit within the
-  // current Y range.
+  type P = { x: number; y: number };
+  const points: P[] = slots.map((s, i) => ({
+    x: graphXForIdx(i, slots.length),
+    y: yFor(Math.max(0, s.mmh)),
+  }));
+
+  // Cardinal spline path with Y clamping to the chart area.
+  function buildPath(pts: P[], close: boolean): string {
+    if (!pts.length) return "";
+    if (pts.length === 1) {
+      const p = pts[0];
+      const baseY = yFor(0);
+      return close
+        ? `M ${p.x} ${baseY} L ${p.x} ${p.y} L ${p.x} ${baseY} Z`
+        : `M ${p.x} ${p.y}`;
+    }
+    const baseY = yFor(0);
+    const topY = GRAPH_PAD_TOP;
+    const clampY = (y: number) => Math.max(topY, Math.min(baseY, y));
+    let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[i - 1] || pts[i];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[i + 2] || p2;
+      const t = 0.5;
+      const cp1x = p1.x + ((p2.x - p0.x) / 6) * t * 2;
+      let cp1y = p1.y + ((p2.y - p0.y) / 6) * t * 2;
+      const cp2x = p2.x - ((p3.x - p1.x) / 6) * t * 2;
+      let cp2y = p2.y - ((p3.y - p1.y) / 6) * t * 2;
+      cp1y = clampY(cp1y);
+      cp2y = clampY(cp2y);
+      d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(
+        2
+      )} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
+    }
+    if (close) {
+      const last = pts[pts.length - 1];
+      const first = pts[0];
+      d += ` L ${last.x.toFixed(2)} ${baseY.toFixed(2)} L ${first.x.toFixed(
+        2
+      )} ${baseY.toFixed(2)} Z`;
+    }
+    return d;
+  }
+
+  const linePath = buildPath(points, false);
+  const fillPath = buildPath(points, true);
+
+  // Initial marker X — subsequent updates come from the parent's setInterval
+  // via setAttribute on the ref. No React state, no RAF, no tween.
+  const initialMarkerX = graphXForIdx(currentIdx, slots.length);
+
+  // Reference lines that fit in the current Y range
   const allRefs = [
     { label: "Skyfall", value: 30 },
     { label: "Kraftigt", value: 10 },
@@ -1238,95 +1331,121 @@ function RainGraph({
   ];
   const refs = allRefs.filter((r) => r.value <= maxMmh);
 
+  const labelEvery = Math.max(1, Math.floor(slots.length / 6));
+
   return (
     <div style={{ position: "relative" }}>
-      <div
+      <svg
+        data-testid="rain-graph-svg"
+        viewBox={`0 0 ${GRAPH_W} ${GRAPH_H}`}
+        preserveAspectRatio="none"
         style={{
-          position: "relative",
-          height: graphH,
-          display: "flex",
-          alignItems: "flex-end",
-          gap: 3,
-          paddingLeft: 70,
-          paddingRight: 4,
+          width: "100%",
+          height: GRAPH_H,
+          display: "block",
           background: "linear-gradient(180deg, #F8FAFC 0%, #fff 100%)",
           borderRadius: 8,
-          borderBottom: `1px solid ${BORDER}`,
+          touchAction: "none",
+          WebkitTapHighlightColor: "transparent",
+          userSelect: "none",
         }}
       >
-        {/* Y-axis reference lines */}
-        {refs.map((ref) => {
-          const y = yFor(ref.value);
-          return (
-            <div
-              key={ref.label}
-              style={{
-                position: "absolute",
-                left: 0,
-                right: 0,
-                top: y,
-                borderTop: `1px dashed ${BORDER}`,
-                pointerEvents: "none",
-              }}
-            >
-              <span
-                style={{
-                  position: "absolute",
-                  left: 4,
-                  top: -8,
-                  fontSize: 10,
-                  color: MUTED,
-                  background: "rgba(255,255,255,0.85)",
-                  padding: "0 4px",
-                  borderRadius: 3,
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {ref.label} {formatMmh(ref.value)}
-              </span>
-            </div>
-          );
-        })}
-        {/* Bars — one per 15-min slot. Even zero-rain bars get a 2 px floor so
-            the graph never looks empty. */}
-        {slots.map((s, i) => {
-          const active = i === currentIdx;
-          const dataH = s.mmh > 0 ? (s.mmh / maxMmh) * (graphH - 4) : 0;
-          const h = Math.max(2, dataH);
-          const intensityRatio = s.mmh / Math.max(0.001, maxMmh);
-          const color =
-            s.mmh < 0.05
-              ? s.isFuture ? "#CBD5E1" : "#94A3B8"
-              : interpolateBlue(intensityRatio);
-          return (
-            <div
-              key={s.time + "_b_" + i}
-              data-testid={`bar-${i}`}
-              style={{
-                flex: 1,
-                height: h,
-                background: color,
-                borderRadius: 3,
-                minWidth: 2,
-                outline: active ? `2px solid ${PRIMARY}` : "none",
-                outlineOffset: 0,
-                opacity: s.isFuture ? 0.85 : 1,
-                position: "relative",
-                transition: "height 0.25s ease-out, background 0.25s ease-out",
-              }}
-              title={`${formatTime(s.time)} · ${formatMmh(s.mmh)} mm/h`}
-            />
-          );
-        })}
+        <defs>
+          <linearGradient id="rainFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={PRIMARY} stopOpacity={0.35} />
+            <stop offset="100%" stopColor={PRIMARY} stopOpacity={0.04} />
+          </linearGradient>
+        </defs>
+
+        {/* Y-axis reference dashed lines */}
+        {refs.map((r) => (
+          <line
+            key={"ref_" + r.label}
+            x1={GRAPH_PAD_LEFT}
+            x2={GRAPH_W - GRAPH_PAD_RIGHT}
+            y1={yFor(r.value)}
+            y2={yFor(r.value)}
+            stroke={BORDER}
+            strokeDasharray="3 4"
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
+
+        {/* Baseline */}
+        <line
+          x1={GRAPH_PAD_LEFT}
+          x2={GRAPH_W - GRAPH_PAD_RIGHT}
+          y1={yFor(0)}
+          y2={yFor(0)}
+          stroke={BORDER}
+          strokeWidth={1}
+          vectorEffect="non-scaling-stroke"
+        />
+
+        {/* Area fill */}
+        <path d={fillPath} fill="url(#rainFill)" />
+
+        {/* Line */}
+        <path
+          d={linePath}
+          stroke={PRIMARY}
+          strokeWidth={2}
+          fill="none"
+          vectorEffect="non-scaling-stroke"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+
+        {/* Active frame marker — vertical dashed line. The parent's animation
+            setInterval updates `x1`/`x2` via setAttribute on every tick. */}
+        <line
+          ref={(el) => {
+            if (markerLineRef) markerLineRef.current = el;
+            if (el && isFinite(initialMarkerX)) {
+              el.setAttribute("x1", String(initialMarkerX));
+              el.setAttribute("x2", String(initialMarkerX));
+            }
+          }}
+          y1={GRAPH_PAD_TOP}
+          y2={GRAPH_H - GRAPH_PAD_BOTTOM}
+          stroke={PRIMARY}
+          strokeWidth={2}
+          strokeDasharray="4 4"
+          vectorEffect="non-scaling-stroke"
+          opacity={0.85}
+        />
+      </svg>
+
+      {/* HTML overlay for non-stretched Y labels */}
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+        {refs.map((r) => (
+          <div
+            key={"lbl_" + r.label}
+            style={{
+              position: "absolute",
+              left: 6,
+              top: `calc(${(yFor(r.value) / GRAPH_H) * 100}% - 8px)`,
+              fontSize: 11,
+              color: MUTED,
+              fontWeight: 500,
+              background: "rgba(255,255,255,0.85)",
+              padding: "0 4px",
+              borderRadius: 3,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {r.label} {formatMmh(r.value)}
+          </div>
+        ))}
       </div>
+
       {/* X axis labels */}
       <div
         style={{
           display: "flex",
-          gap: 3,
-          paddingLeft: 70,
-          paddingRight: 4,
-          marginTop: 4,
+          paddingLeft: `${(GRAPH_PAD_LEFT / GRAPH_W) * 100}%`,
+          paddingRight: `${(GRAPH_PAD_RIGHT / GRAPH_W) * 100}%`,
+          marginTop: 2,
           fontSize: 9,
           color: MUTED,
         }}
