@@ -1450,9 +1450,21 @@ function RainGraph({
 
         {/* Active frame marker — vertical dashed line. x1/x2 are driven by
             React via `initialMarkerX` (time-based) so the marker re-renders
-            in sync with the radar animation on every tick. The ref + extra
-            setAttribute is a safety net for any environment where the React
-            attr update lags (e.g. legacy iOS Safari). */}
+            in sync with the radar animation on every tick. Drawn with a
+            WHITE halo underlay so it stays clearly visible against the blue
+            area fill and the Y-axis label backgrounds. */}
+        {/* White halo underlay for visibility */}
+        <line
+          x1={initialMarkerX}
+          x2={initialMarkerX}
+          y1={GRAPH_PAD_TOP - 2}
+          y2={GRAPH_H - GRAPH_PAD_BOTTOM + 2}
+          stroke="#FFFFFF"
+          strokeWidth={5}
+          vectorEffect="non-scaling-stroke"
+          opacity={0.85}
+        />
+        {/* Blue dashed marker line */}
         <line
           ref={(el) => {
             if (markerLineRef) markerLineRef.current = el;
@@ -1463,13 +1475,22 @@ function RainGraph({
           }}
           x1={initialMarkerX}
           x2={initialMarkerX}
-          y1={GRAPH_PAD_TOP}
-          y2={GRAPH_H - GRAPH_PAD_BOTTOM}
-          stroke={PRIMARY}
-          strokeWidth={2}
-          strokeDasharray="4 4"
+          y1={GRAPH_PAD_TOP - 2}
+          y2={GRAPH_H - GRAPH_PAD_BOTTOM + 2}
+          stroke={PRIMARY_DARK}
+          strokeWidth={2.5}
+          strokeDasharray="5 4"
           vectorEffect="non-scaling-stroke"
-          opacity={0.85}
+          opacity={1}
+        />
+        {/* Solid dot at the top of the marker line so the eye locks onto it */}
+        <circle
+          cx={initialMarkerX}
+          cy={GRAPH_PAD_TOP + 2}
+          r={4}
+          fill={PRIMARY_DARK}
+          stroke="#FFFFFF"
+          strokeWidth={1.5}
         />
       </svg>
 
