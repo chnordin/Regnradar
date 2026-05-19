@@ -111,11 +111,12 @@ export default function Regnradar() {
     { time: number; path: string; host: string; isNowcast: boolean }[]
   >([]);
   const [currentIdx, setCurrentIdx] = useState(0);
-  // Independent radar frame index so the radar tile cycles through EVERY
-  // available frame (past + nowcast), not just whichever frame happens to be
-  // nearest to the current slot's time. This ensures visible motion even when
-  // RainViewer only has 2 past frames + 0 nowcast right now.
-  const [radarFrameIdx, setRadarFrameIdx] = useState(0);
+  // ─── Single shared frame index ─────────────────────────────────────────────
+  // ONE setInterval below drives this index. Every tick: increment, swap the
+  // radar tile to frames[frameIdx], and move the graph marker to the X
+  // corresponding to that frame's TIME (so radar tile and graph marker are
+  // perfectly synced — there is no separate slot animation).
+  const [frameIdx, setFrameIdx] = useState(0);
   const [playing, setPlaying] = useState(true);
   const playTimerRef = useRef<any>(null);
   const scrubResumeRef = useRef<number | null>(null);
@@ -125,21 +126,20 @@ export default function Regnradar() {
   const firstFetchRef = useRef(true);
   // ─── Graph marker DOM ref ─────────────────────────────────────────────────
   // The active-frame marker on the area chart is a vertical <line> whose x1/x2
-  // are updated by direct setAttribute inside the existing animation
-  // setInterval below. No React state, no RAF, no tween for the marker.
+  // are updated by direct setAttribute inside the single animation interval.
   const markerLineRef = useRef<SVGLineElement | null>(null);
-  const slotsLengthRef = useRef(0);
-  const framesLengthRef = useRef(0);
-  // DEBUG refs: read current values from inside setInterval tick (which only
-  // closes over the function body, not over per-render state).
-  const currentFramesRef = useRef<typeof frames>([]);
-  const currentRadarIdxRef = useRef(0);
-  currentFramesRef.current = frames;
-  currentRadarIdxRef.current = radarFrameIdx;
-  const setMarkerToSlotIdx = (idx: number) => {
-    const n = slotsLengthRef.current;
-    if (n <= 0) return;
-    const x = graphXForIdx(idx, n);
+  // Refs used by the interval tick so it can read the latest frames array and
+  // log/inspect the current index without depending on render-closures.
+  const framesRef = useRef<typeof frames>([]);
+  const frameIdxRef = useRef(0);
+  framesRef.current = frames;
+  frameIdxRef.current = frameIdx;
+  // Move the graph marker to the X position corresponding to a frame's TIME.
+  // This is the ONLY way the marker moves — no separate slot index animation.
+  const setMarkerToFrame = (idx: number) => {
+    const f = framesRef.current[idx];
+    if (!f) return;
+    const x = graphXForTime(f.time);
     if (markerLineRef.current && isFinite(x)) {
       markerLineRef.current.setAttribute("x1", String(x));
       markerLineRef.current.setAttribute("x2", String(x));
