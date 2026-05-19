@@ -1,5 +1,5 @@
 // Regnradar service worker
-const CACHE = 'regnradar-v1';
+const CACHE = 'regnradar-v2';
 const ASSETS = ['/', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
