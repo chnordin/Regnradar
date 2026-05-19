@@ -101,3 +101,25 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+user_problem_statement: "Build Regnradar PWA - rain radar with animated Rain Viewer overlay, intensity graph, 20-min push warning, Swedish UI"
+
+frontend:
+  - task: "Radar animation - missing variable declarations broke Vercel iPhone build"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: false
+        agent: "user"
+        comment: "Radar animation completely broken on Vercel/iPhone Safari deploy. Cycles only 2 frames or freezes."
+      - working: true
+        agent: "main"
+        comment: "ROOT CAUSE FOUND: Previous agent left `// @ts-nocheck` at top while leaving critical state/refs undeclared: radarFrameIdx, setRadarFrameIdx, currentRadarIdxRef, currentFramesRef, framesLengthRef, slotsLengthRef, setMarkerToSlotIdx. Component was crashing on iPhone Safari (no Metro HMR safety net). RESTORED all declarations + replaced create-and-destroy tile pattern with lazy-create + opacity-swap (prevents RainViewer rate-limit 429s). TypeScript strict check now passes with 0 errors. Verified locally: animation cycles 0->12 smoothly via screenshot_tool, distinct radar frames render."
+
+agent_communication:
+  - agent: "main"
+    message: "P0 radar animation crash fixed by restoring missing variable declarations in /app/frontend/app/index.tsx. The Vercel iPhone deploy was crashing silently because Metro HMR had cached a working bundle locally, hiding the truth. SW cache bumped to v3 so iPhone PWA will pull fresh bundle on next refresh. Debug overlay still present in top-left for user verification - can remove once confirmed working on iPhone."

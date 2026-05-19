@@ -101,7 +101,7 @@ export default function Regnradar() {
   const mapEl = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const userMarkerRef = useRef<any>(null);
-  const radarLayersRef = useRef<Set<any>>(new Set());
+  // (radarLayersRef removed — replaced by radarLayersByPathRef below)
 
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [city, setCity] = useState<string>("Hämtar plats…");
@@ -111,12 +111,14 @@ export default function Regnradar() {
     { time: number; path: string; host: string; isNowcast: boolean }[]
   >([]);
   const [currentIdx, setCurrentIdx] = useState(0);
-  // ─── Single shared frame index ─────────────────────────────────────────────
-  // ONE setInterval below drives this index. Every tick: increment, swap the
-  // radar tile to frames[frameIdx], and move the graph marker to the X
-  // corresponding to that frame's TIME (so radar tile and graph marker are
-  // perfectly synced — there is no separate slot animation).
-  const [frameIdx, setFrameIdx] = useState(0);
+  // ─── Radar frame index ─────────────────────────────────────────────────────
+  // ONE setInterval below drives this index. Every tick:
+  //   1) increment `radarFrameIdx`
+  //   2) the tile-render effect swaps opacity on the corresponding pre-loaded
+  //      Leaflet tileLayer (NO new tile fetches — all frames pre-loaded once)
+  //   3) the graph-marker <line> is moved via setAttribute to the slot index
+  //      nearest to that frame's time.
+  const [radarFrameIdx, setRadarFrameIdx] = useState(0);
   const [playing, setPlaying] = useState(true);
   const playTimerRef = useRef<any>(null);
   const scrubResumeRef = useRef<number | null>(null);
@@ -128,18 +130,26 @@ export default function Regnradar() {
   // The active-frame marker on the area chart is a vertical <line> whose x1/x2
   // are updated by direct setAttribute inside the single animation interval.
   const markerLineRef = useRef<SVGLineElement | null>(null);
-  // Refs used by the interval tick so it can read the latest frames array and
-  // log/inspect the current index without depending on render-closures.
-  const framesRef = useRef<typeof frames>([]);
-  const frameIdxRef = useRef(0);
-  framesRef.current = frames;
-  frameIdxRef.current = frameIdx;
-  // Move the graph marker to the X position corresponding to a frame's TIME.
-  // This is the ONLY way the marker moves — no separate slot index animation.
-  const setMarkerToFrame = (idx: number) => {
-    const f = framesRef.current[idx];
-    if (!f) return;
-    const x = graphXForTime(f.time);
+  // Refs used by the interval tick to read latest arrays/lengths without
+  // depending on render-closures (so the interval never needs recreation
+  // when `frames` or `slots` change).
+  const currentFramesRef = useRef<typeof frames>([]);
+  const currentRadarIdxRef = useRef(0);
+  const framesLengthRef = useRef(0);
+  const slotsLengthRef = useRef(0);
+  currentFramesRef.current = frames;
+  currentRadarIdxRef.current = radarFrameIdx;
+  // ─── Pre-loaded radar tileLayers, keyed by frame path ──────────────────────
+  // Each frame gets its own L.tileLayer created ONCE (opacity 0). On each tick
+  // we just flip opacity — Leaflet keeps tiles in the DOM cache so no new
+  // network requests fire. This is what avoids the RainViewer rate-limit
+  // (HTTP 429) that broke the animation on iPhone Safari.
+  const radarLayersByPathRef = useRef<Map<string, any>>(new Map());
+  // Move the graph marker to the X position for a given slot index.
+  const setMarkerToSlotIdx = (idx: number) => {
+    const n = slotsLengthRef.current;
+    if (n <= 0) return;
+    const x = graphXForIdx(idx, n);
     if (markerLineRef.current && isFinite(x)) {
       markerLineRef.current.setAttribute("x1", String(x));
       markerLineRef.current.setAttribute("x2", String(x));
@@ -377,46 +387,63 @@ export default function Regnradar() {
     return () => clearInterval(id);
   }, [fetchFrames]);
 
-  // ─── Render current radar frame as a tile layer (strict single-layer) ──────
-  // Maintains AT MOST one previous "outgoing" layer + one new "incoming" layer.
-  // On every frame change ALL other tracked layers are removed immediately and
-  // any in-progress cross-fade is cancelled — guarantees no ghost stacking
-  // during rapid scrubbing.
-  // ─── Radar tile rendering — SIMPLE INSTANT SWAP ────────────────────────────
-  // No cross-fade, no load event, no RAF. Each tick: remove all existing
-  // radar layers and add the new one at target opacity immediately. Leaflet
-  // caches tiles internally so after the first loop everything is snappy.
+  // ─── Radar tile rendering — LAZY CREATE + OPACITY SWAP ────────────────────
+  // We DON'T pre-create all frames on mount (that fires 100+ tile requests at
+  // once and trips RainViewer's rate-limit / HTTP 429). Instead, each frame's
+  // tileLayer is created the FIRST time it's about to be shown, then kept on
+  // the map (opacity 0) so subsequent appearances are instant cache hits.
+  //
+  // This effect handles two responsibilities every time `frames` or
+  // `radarFrameIdx` changes:
+  //   1) Ensure a Leaflet tileLayer exists for the active frame (create it
+  //      lazily at opacity 0 if missing — Leaflet will fetch its tiles ONCE,
+  //      browser/Leaflet cache hits after that).
+  //   2) Set opacity 0 on every layer; opacity 0.7 on the active one.
+  //   3) Remove any layers whose path is no longer in the current frames
+  //      list (e.g. when RainViewer drops old past frames on refresh).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
-    const f = frames[radarFrameIdx];
-    if (!f) return;
+    const layers = radarLayersByPathRef.current;
+    const active = frames[radarFrameIdx];
+    if (!active) return;
 
-    const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
+    // 1) Lazy-create the active frame's layer if it doesn't exist yet.
+    if (!layers.has(active.path)) {
+      const url = `${active.host}${active.path}/256/{z}/{x}/{y}/2/1_1.png`;
+      const layer = L.tileLayer(url, {
+        tileSize: 256,
+        opacity: 0,
+        zIndex: 401,
+        maxNativeZoom: 7,
+        minNativeZoom: 0,
+        maxZoom: 18,
+        fadeAnimation: false,
+        keepBuffer: 8,
+        updateWhenIdle: false,
+        attribution: "© RainViewer",
+      });
+      layer.addTo(map);
+      layers.set(active.path, layer);
+    }
 
-    // Remove all existing radar layers immediately.
-    for (const layer of radarLayersRef.current) {
+    // 2) Opacity swap on every existing layer.
+    for (const [path, layer] of layers) {
       try {
-        map.removeLayer(layer);
+        layer.setOpacity(path === active.path ? 0.7 : 0);
       } catch {}
     }
-    radarLayersRef.current.clear();
 
-    // Add new layer at full target opacity straight away.
-    const layer = L.tileLayer(url, {
-      tileSize: 256,
-      opacity: 0.7,
-      zIndex: 401,
-      maxNativeZoom: 7,
-      minNativeZoom: 0,
-      maxZoom: 18,
-      fadeAnimation: false,
-      keepBuffer: 4,
-      updateWhenIdle: false,
-      attribution: "© RainViewer",
-    });
-    layer.addTo(map);
-    radarLayersRef.current.add(layer);
+    // 3) Drop layers no longer in frames (cleanup on RainViewer refresh).
+    const validPaths = new Set(frames.map((f) => f.path));
+    for (const [path, layer] of layers) {
+      if (!validPaths.has(path)) {
+        try {
+          map.removeLayer(layer);
+        } catch {}
+        layers.delete(path);
+      }
+    }
   }, [frames, radarFrameIdx]);
 
   // ─── Animation loop ─────────────────────────────────────────────────────────
