@@ -130,6 +130,12 @@ export default function Regnradar() {
   const markerLineRef = useRef<SVGLineElement | null>(null);
   const slotsLengthRef = useRef(0);
   const framesLengthRef = useRef(0);
+  // DEBUG refs: read current values from inside setInterval tick (which only
+  // closes over the function body, not over per-render state).
+  const currentFramesRef = useRef<typeof frames>([]);
+  const currentRadarIdxRef = useRef(0);
+  currentFramesRef.current = frames;
+  currentRadarIdxRef.current = radarFrameIdx;
   const setMarkerToSlotIdx = (idx: number) => {
     const n = slotsLengthRef.current;
     if (n <= 0) return;
@@ -439,6 +445,18 @@ export default function Regnradar() {
   useEffect(() => {
     if (!playing) return;
     const tick = () => {
+      // ── DEBUG: emit each tick so we can see in the console whether the
+      //    interval is alive and which radar frame is being shown. ──────────
+      try {
+        const n = framesLengthRef.current;
+        const i = currentRadarIdxRef.current;
+        const f = currentFramesRef.current[i];
+        const url = f ? `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png` : "(no frame)";
+        // eslint-disable-next-line no-console
+        console.log(
+          `[regnradar] tick idx=${i}/${Math.max(0, n - 1)} (n=${n}) url=${url}`
+        );
+      } catch {}
       // Advance graph-marker slot index
       setCurrentIdx((i) => {
         const n = slotsLengthRef.current;
@@ -452,7 +470,9 @@ export default function Regnradar() {
       setRadarFrameIdx((i) => {
         const n = framesLengthRef.current;
         if (n <= 0) return 0;
-        return (i + 1) % n;
+        const next = (i + 1) % n;
+        currentRadarIdxRef.current = next;
+        return next;
       });
     };
     playTimerRef.current = setInterval(tick, 800);
@@ -863,6 +883,35 @@ export default function Regnradar() {
       {/* Map */}
       <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
         <div ref={mapEl} data-testid="map-container" style={{ position: "absolute", inset: 0 }} />
+        {/* ── DEBUG counter overlay (top-left). Shows radarFrameIdx / total
+            and the last 24 chars of the active radar URL. Updates on every
+            React re-render = every tick (since setRadarFrameIdx is called). */}
+        <div
+          data-testid="debug-counter"
+          style={{
+            position: "absolute",
+            top: 6,
+            left: 6,
+            zIndex: 1200,
+            background: "rgba(15,23,42,0.85)",
+            color: "#fff",
+            fontFamily: "monospace",
+            fontSize: 11,
+            padding: "4px 8px",
+            borderRadius: 6,
+            pointerEvents: "none",
+            maxWidth: "60%",
+            lineHeight: 1.3,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+          }}
+        >
+          {`idx=${radarFrameIdx} / ${frames.length}\n${
+            frames[radarFrameIdx]
+              ? frames[radarFrameIdx].path.slice(-30)
+              : "(no frame)"
+          }`}
+        </div>
         {/* Geo error overlay */}
         {geoError && (
           <div
