@@ -102,30 +102,6 @@ export default function Regnradar() {
   const mapRef = useRef<any>(null);
   const userMarkerRef = useRef<any>(null);
   const radarLayersRef = useRef<Set<any>>(new Set());
-  const activeFadeRef = useRef<number | null>(null);
-  // Path of the radar tile currently displayed (used to skip layer-recreate
-  // when the animation lands on the same frame again — which would otherwise
-  // cause the new layer to fade in from opacity 0 every tick = visible flicker).
-  const currentRadarPathRef = useRef<string | null>(null);
-  // Live opacity tracking per layer. Leaflet's `tileLayer.options.opacity`
-  // does NOT reliably reflect the value passed to `setOpacity`, which used to
-  // make our cross-fade start from a wrong value (collapsing the outgoing
-  // layer to 0 instantly → visible flash). We track it ourselves here.
-  const layerOpacityRef = useRef<WeakMap<any, number>>(new WeakMap());
-  const setLayerOpacity = (layer: any, op: number) => {
-    try {
-      layer.setOpacity(op);
-    } catch {}
-    layerOpacityRef.current.set(layer, op);
-  };
-  const getLayerOpacity = (layer: any, fallback: number) => {
-    const v = layerOpacityRef.current.get(layer);
-    return typeof v === "number" ? v : fallback;
-  };
-  // Wrap-hold flag — keeps the radar visually on the last frame for one extra
-  // tick before looping back to the first frame, so the user perceives
-  // "playback finished, restarting" rather than "moved backward in time".
-  const wrapHoldRef = useRef(false);
 
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [city, setCity] = useState<string>("Hämtar plats…");
@@ -367,15 +343,12 @@ export default function Regnradar() {
       });
       const data = await r.json();
       const host = data.host || "https://tilecache.rainviewer.com";
-      const cutoff = Date.now() / 1000 - 15 * 60; // keep only last 15 min of past
-      const past = (data?.radar?.past || [])
-        .filter((f: any) => f.time >= cutoff)
-        .map((f: any) => ({
-          time: f.time,
-          path: f.path,
-          host,
-          isNowcast: false,
-        }));
+      const past = (data?.radar?.past || []).map((f: any) => ({
+        time: f.time,
+        path: f.path,
+        host,
+        isNowcast: false,
+      }));
       const nowcast = (data?.radar?.nowcast || []).map((f: any) => ({
         time: f.time,
         path: f.path,
@@ -403,50 +376,30 @@ export default function Regnradar() {
   // On every frame change ALL other tracked layers are removed immediately and
   // any in-progress cross-fade is cancelled — guarantees no ghost stacking
   // during rapid scrubbing.
+  // ─── Radar tile rendering — SIMPLE INSTANT SWAP ────────────────────────────
+  // No cross-fade, no load event, no RAF. Each tick: remove all existing
+  // radar layers and add the new one at target opacity immediately. Leaflet
+  // caches tiles internally so after the first loop everything is snappy.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
-    // Radar tile follows its own `radarFrameIdx` so EVERY frame (past +
-    // nowcast) is visited during the animation loop — not just whichever
-    // happens to be the nearest match to the current slot's time. The graph
-    // marker (slot timeline) and the radar tile cycle independently.
     const f = frames[radarFrameIdx];
     if (!f) return;
 
-    const TARGET_OPACITY = 0.7;
-    const FADE_MS = 350;
-
-    // ── Flicker guard: if the new frame's URL is the same as the one
-    // currently displayed, do nothing. Otherwise we'd recreate the layer at
-    // opacity 0 and fade it in again every tick = visible flicker. ─────────
     const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
-    if (currentRadarPathRef.current === url) return;
-    currentRadarPathRef.current = url;
 
-    // 1. Cancel any in-progress fade animation immediately.
-    if (activeFadeRef.current) {
-      cancelAnimationFrame(activeFadeRef.current);
-      activeFadeRef.current = null;
-    }
-
-    // 2. Snapshot existing layers. Keep only the MOST RECENT one as the
-    //    outgoing partner for the cross-fade — wipe all others immediately
-    //    so they cannot stack as ghosts.
-    const existing = Array.from(radarLayersRef.current);
-    const outgoing = existing.length ? existing[existing.length - 1] : null;
-    for (const layer of existing) {
-      if (layer === outgoing) continue;
+    // Remove all existing radar layers immediately.
+    for (const layer of radarLayersRef.current) {
       try {
-        setLayerOpacity(layer, 0);
         map.removeLayer(layer);
       } catch {}
-      radarLayersRef.current.delete(layer);
     }
+    radarLayersRef.current.clear();
 
-    // 3. Add the new layer at opacity 0.
-    const incoming = L.tileLayer(url, {
+    // Add new layer at full target opacity straight away.
+    const layer = L.tileLayer(url, {
       tileSize: 256,
-      opacity: 0,
+      opacity: 0.7,
       zIndex: 401,
       maxNativeZoom: 7,
       minNativeZoom: 0,
@@ -456,68 +409,8 @@ export default function Regnradar() {
       updateWhenIdle: false,
       attribution: "© RainViewer",
     });
-    setLayerOpacity(incoming, 0);
-    incoming.addTo(map);
-    radarLayersRef.current.add(incoming);
-
-    let fallbackId: any = null;
-    let started = false;
-
-    const removeOutgoing = () => {
-      if (!outgoing) return;
-      try {
-        setLayerOpacity(outgoing, 0);
-        map.removeLayer(outgoing);
-      } catch {}
-      radarLayersRef.current.delete(outgoing);
-    };
-
-    const startFade = () => {
-      if (started) return;
-      started = true;
-      if (fallbackId) clearTimeout(fallbackId);
-
-      const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
-      // Read the OUTGOING layer's CURRENT live opacity from our own tracking
-      // map (Leaflet's options.opacity is not reliable here).
-      const outStart = outgoing ? getLayerOpacity(outgoing, TARGET_OPACITY) : 0;
-      const t0 = performance.now();
-
-      const tick = (now: number) => {
-        const p = Math.min(1, (now - t0) / FADE_MS);
-        const e = easeOutCubic(p);
-        try {
-          setLayerOpacity(incoming, TARGET_OPACITY * e);
-          if (outgoing) setLayerOpacity(outgoing, outStart * (1 - e));
-        } catch {}
-        if (p < 1) {
-          activeFadeRef.current = requestAnimationFrame(tick);
-        } else {
-          activeFadeRef.current = null;
-          // Snap to exact values before removing, to avoid any sub-pixel flash.
-          try {
-            setLayerOpacity(incoming, TARGET_OPACITY);
-          } catch {}
-          removeOutgoing();
-        }
-      };
-      activeFadeRef.current = requestAnimationFrame(tick);
-    };
-
-    incoming.on("load", startFade);
-    // Fallback if 'load' never fires (e.g. all tiles cached).
-    fallbackId = setTimeout(startFade, 800);
-
-    return () => {
-      // Cancel pending fade / fallback. We do NOT touch radarLayersRef here —
-      // the next effect run will handle aggressive cleanup of every leftover
-      // layer so that even fast scrubbing converges to a single active layer.
-      if (activeFadeRef.current) {
-        cancelAnimationFrame(activeFadeRef.current);
-        activeFadeRef.current = null;
-      }
-      if (fallbackId) clearTimeout(fallbackId);
-    };
+    layer.addTo(map);
+    radarLayersRef.current.add(layer);
   }, [frames, radarFrameIdx]);
 
   // ─── Animation loop ─────────────────────────────────────────────────────────
@@ -554,22 +447,12 @@ export default function Regnradar() {
         setMarkerToSlotIdx(newIdx);
         return newIdx;
       });
-      // Advance radar frame index with a wrap-hold so a 2-frame loop doesn't
-      // feel like back-and-forth motion (forward, BACKWARD, forward, BACKWARD).
-      // We hold the last frame for one extra tick before resetting to 0.
+      // Advance radar frame: simple (i+1) % n. With many frames now fetched
+      // (full RainViewer past + nowcast) this gives a clean forward loop.
       setRadarFrameIdx((i) => {
         const n = framesLengthRef.current;
         if (n <= 0) return 0;
-        if (n === 1) return 0;
-        if (i >= n - 1) {
-          if (!wrapHoldRef.current) {
-            wrapHoldRef.current = true;
-            return i; // stay on last frame for one extra tick
-          }
-          wrapHoldRef.current = false;
-          return 0; // now wrap back to start
-        }
-        return i + 1;
+        return (i + 1) % n;
       });
     };
     playTimerRef.current = setInterval(tick, 800);
