@@ -103,6 +103,10 @@ export default function Regnradar() {
   const userMarkerRef = useRef<any>(null);
   const radarLayersRef = useRef<Set<any>>(new Set());
   const activeFadeRef = useRef<number | null>(null);
+  // Path of the radar tile currently displayed (used to skip layer-recreate
+  // when the animation lands on the same frame again — which would otherwise
+  // cause the new layer to fade in from opacity 0 every tick = visible flicker).
+  const currentRadarPathRef = useRef<string | null>(null);
 
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [city, setCity] = useState<string>("Hämtar plats…");
@@ -112,6 +116,11 @@ export default function Regnradar() {
     { time: number; path: string; host: string; isNowcast: boolean }[]
   >([]);
   const [currentIdx, setCurrentIdx] = useState(0);
+  // Independent radar frame index so the radar tile cycles through EVERY
+  // available frame (past + nowcast), not just whichever frame happens to be
+  // nearest to the current slot's time. This ensures visible motion even when
+  // RainViewer only has 2 past frames + 0 nowcast right now.
+  const [radarFrameIdx, setRadarFrameIdx] = useState(0);
   const [playing, setPlaying] = useState(true);
   const playTimerRef = useRef<any>(null);
   const scrubResumeRef = useRef<number | null>(null);
@@ -125,6 +134,7 @@ export default function Regnradar() {
   // setInterval below. No React state, no RAF, no tween for the marker.
   const markerLineRef = useRef<SVGLineElement | null>(null);
   const slotsLengthRef = useRef(0);
+  const framesLengthRef = useRef(0);
   const setMarkerToSlotIdx = (idx: number) => {
     const n = slotsLengthRef.current;
     if (n <= 0) return;
@@ -377,24 +387,22 @@ export default function Regnradar() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !L || !frames.length) return;
-    // Find the radar frame whose timestamp is closest to the current slot's
-    // time. This decouples the long animation (cycling through 10 bars over
-    // 2 h 15 min) from the much shorter radar coverage.
-    const slot = slots[currentIdx];
-    if (!slot) return;
-    let f = frames[0];
-    let bestDt = Math.abs(frames[0].time - slot.time);
-    for (let i = 1; i < frames.length; i++) {
-      const dt = Math.abs(frames[i].time - slot.time);
-      if (dt < bestDt) {
-        bestDt = dt;
-        f = frames[i];
-      }
-    }
+    // Radar tile follows its own `radarFrameIdx` so EVERY frame (past +
+    // nowcast) is visited during the animation loop — not just whichever
+    // happens to be the nearest match to the current slot's time. The graph
+    // marker (slot timeline) and the radar tile cycle independently.
+    const f = frames[radarFrameIdx];
     if (!f) return;
 
     const TARGET_OPACITY = 0.7;
     const FADE_MS = 350;
+
+    // ── Flicker guard: if the new frame's URL is the same as the one
+    // currently displayed, do nothing. Otherwise we'd recreate the layer at
+    // opacity 0 and fade it in again every tick = visible flicker. ─────────
+    const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
+    if (currentRadarPathRef.current === url) return;
+    currentRadarPathRef.current = url;
 
     // 1. Cancel any in-progress fade animation immediately.
     if (activeFadeRef.current) {
@@ -417,7 +425,6 @@ export default function Regnradar() {
     }
 
     // 3. Add the new layer at opacity 0.
-    const url = `${f.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`;
     const incoming = L.tileLayer(url, {
       tileSize: 256,
       opacity: 0,
@@ -485,7 +492,7 @@ export default function Regnradar() {
       }
       if (fallbackId) clearTimeout(fallbackId);
     };
-  }, [frames, currentIdx, slots]);
+  }, [frames, radarFrameIdx]);
 
   // ─── Animation loop ─────────────────────────────────────────────────────────
   // The animation cycles through `slots` (the 15-min Open-Meteo timeline),
@@ -497,6 +504,15 @@ export default function Regnradar() {
     slotsLengthRef.current = slots.length;
   }, [slots.length]);
   useEffect(() => {
+    framesLengthRef.current = frames.length;
+    // Clamp radarFrameIdx whenever frames update so we don't index past end.
+    if (frames.length > 0) {
+      setRadarFrameIdx((i) => (i >= frames.length ? 0 : i));
+    } else {
+      setRadarFrameIdx(0);
+    }
+  }, [frames.length]);
+  useEffect(() => {
     if (!playing || !slots.length) return;
     playTimerRef.current = setInterval(() => {
       setCurrentIdx((i) => {
@@ -504,7 +520,14 @@ export default function Regnradar() {
         setMarkerToSlotIdx(newIdx);
         return newIdx;
       });
-    }, 400);
+      // Advance radar frame independently so EVERY radar frame (past +
+      // nowcast) gets shown during the loop, even when slot→nearest-frame
+      // mapping would otherwise collapse many slots to the same frame.
+      setRadarFrameIdx((i) => {
+        const n = framesLengthRef.current;
+        return n > 0 ? (i + 1) % n : 0;
+      });
+    }, 500);
     return () => clearInterval(playTimerRef.current);
   }, [playing, slots.length]);
 
