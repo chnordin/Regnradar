@@ -107,6 +107,25 @@ export default function Regnradar() {
   // when the animation lands on the same frame again — which would otherwise
   // cause the new layer to fade in from opacity 0 every tick = visible flicker).
   const currentRadarPathRef = useRef<string | null>(null);
+  // Live opacity tracking per layer. Leaflet's `tileLayer.options.opacity`
+  // does NOT reliably reflect the value passed to `setOpacity`, which used to
+  // make our cross-fade start from a wrong value (collapsing the outgoing
+  // layer to 0 instantly → visible flash). We track it ourselves here.
+  const layerOpacityRef = useRef<WeakMap<any, number>>(new WeakMap());
+  const setLayerOpacity = (layer: any, op: number) => {
+    try {
+      layer.setOpacity(op);
+    } catch {}
+    layerOpacityRef.current.set(layer, op);
+  };
+  const getLayerOpacity = (layer: any, fallback: number) => {
+    const v = layerOpacityRef.current.get(layer);
+    return typeof v === "number" ? v : fallback;
+  };
+  // Wrap-hold flag — keeps the radar visually on the last frame for one extra
+  // tick before looping back to the first frame, so the user perceives
+  // "playback finished, restarting" rather than "moved backward in time".
+  const wrapHoldRef = useRef(false);
 
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [city, setCity] = useState<string>("Hämtar plats…");
@@ -418,7 +437,7 @@ export default function Regnradar() {
     for (const layer of existing) {
       if (layer === outgoing) continue;
       try {
-        layer.setOpacity(0);
+        setLayerOpacity(layer, 0);
         map.removeLayer(layer);
       } catch {}
       radarLayersRef.current.delete(layer);
@@ -437,6 +456,7 @@ export default function Regnradar() {
       updateWhenIdle: false,
       attribution: "© RainViewer",
     });
+    setLayerOpacity(incoming, 0);
     incoming.addTo(map);
     radarLayersRef.current.add(incoming);
 
@@ -446,7 +466,7 @@ export default function Regnradar() {
     const removeOutgoing = () => {
       if (!outgoing) return;
       try {
-        outgoing.setOpacity(0);
+        setLayerOpacity(outgoing, 0);
         map.removeLayer(outgoing);
       } catch {}
       radarLayersRef.current.delete(outgoing);
@@ -458,20 +478,26 @@ export default function Regnradar() {
       if (fallbackId) clearTimeout(fallbackId);
 
       const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
-      const outStart = outgoing ? (outgoing.options.opacity ?? TARGET_OPACITY) : 0;
+      // Read the OUTGOING layer's CURRENT live opacity from our own tracking
+      // map (Leaflet's options.opacity is not reliable here).
+      const outStart = outgoing ? getLayerOpacity(outgoing, TARGET_OPACITY) : 0;
       const t0 = performance.now();
 
       const tick = (now: number) => {
         const p = Math.min(1, (now - t0) / FADE_MS);
         const e = easeOutCubic(p);
         try {
-          incoming.setOpacity(TARGET_OPACITY * e);
-          if (outgoing) outgoing.setOpacity(outStart * (1 - e));
+          setLayerOpacity(incoming, TARGET_OPACITY * e);
+          if (outgoing) setLayerOpacity(outgoing, outStart * (1 - e));
         } catch {}
         if (p < 1) {
           activeFadeRef.current = requestAnimationFrame(tick);
         } else {
           activeFadeRef.current = null;
+          // Snap to exact values before removing, to avoid any sub-pixel flash.
+          try {
+            setLayerOpacity(incoming, TARGET_OPACITY);
+          } catch {}
           removeOutgoing();
         }
       };
@@ -520,14 +546,28 @@ export default function Regnradar() {
         setMarkerToSlotIdx(newIdx);
         return newIdx;
       });
-      // Advance radar frame independently so EVERY radar frame (past +
-      // nowcast) gets shown during the loop, even when slot→nearest-frame
-      // mapping would otherwise collapse many slots to the same frame.
+      // Radar frame advances independently. With only 2-6 frames available,
+      // a naive (i+1) % n cycle would feel like back-and-forth motion: e.g.
+      // with 2 frames T1 (older) and T2 (newer), the loop 0→1→0→1 visually
+      // reads as "forward, BACKWARD, forward, BACKWARD". To prevent that
+      // perceived reversal, we hold the last frame for ONE extra tick before
+      // wrapping back to frame 0, so the user perceives a brief pause and
+      // restart instead of a backward step.
       setRadarFrameIdx((i) => {
         const n = framesLengthRef.current;
-        return n > 0 ? (i + 1) % n : 0;
+        if (n <= 0) return 0;
+        if (n === 1) return 0;
+        if (i >= n - 1) {
+          if (!wrapHoldRef.current) {
+            wrapHoldRef.current = true;
+            return i; // stay on last frame for one extra tick
+          }
+          wrapHoldRef.current = false;
+          return 0; // now wrap back to start
+        }
+        return i + 1;
       });
-    }, 500);
+    }, 800);
     return () => clearInterval(playTimerRef.current);
   }, [playing, slots.length]);
 
