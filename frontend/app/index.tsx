@@ -715,12 +715,78 @@ export default function Regnradar() {
     });
   };
 
+  // ─── Push subscription helpers ─────────────────────────────────────────────
+  // Sends the device's PushSubscription + current coordinates to our Vercel
+  // serverless endpoint. The server stores it in Upstash and a 5-min cron
+  // checks Open-Meteo and dispatches push notifications when rain is near.
+  const urlBase64ToUint8Array = (base64String: string) => {
+    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(base64);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  };
+
+  const subscribeToPush = async (coordsArg?: { lat: number; lng: number }) => {
+    try {
+      if (typeof window === "undefined") return;
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+      const c = coordsArg || coords;
+      if (!c) return;
+      // 1. Fetch VAPID public key from our backend.
+      const keyRes = await fetch("/api/push/vapid-public-key", { cache: "force-cache" });
+      if (!keyRes.ok) {
+        console.warn("vapid-public-key fetch failed", keyRes.status);
+        return;
+      }
+      const { publicKey } = await keyRes.json();
+      if (!publicKey) return;
+      // 2. Get / create the PushManager subscription with the VAPID key.
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        });
+      }
+      // 3. POST subscription + coords to the backend.
+      await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subscription: sub.toJSON(),
+          lat: c.lat,
+          lng: c.lng,
+        }),
+      });
+    } catch (e) {
+      console.warn("subscribeToPush failed", e);
+    }
+  };
+
+  // ─── Re-subscribe when coords change AFTER permission already granted ─────
+  // (e.g. user moves, or returns to the PWA on a new day). The endpoint is
+  // idempotent — same `endpoint` key just overwrites the stored lat/lng.
+  useEffect(() => {
+    if (pushPermission !== "granted") return;
+    if (!coords) return;
+    subscribeToPush(coords);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pushPermission, coords?.lat, coords?.lng]);
+
   const requestPushPermission = async () => {
     setShowPushPrompt(false);
     if (!("Notification" in window)) return;
     try {
       const p = await Notification.requestPermission();
       setPushPermission(p);
+      if (p === "granted") {
+        // Trigger an immediate subscribe + send to backend.
+        await subscribeToPush();
+        setNotifToast("Notiser aktiverade — du varnas inom 20 min innan regn.");
+      }
     } catch {}
   };
 

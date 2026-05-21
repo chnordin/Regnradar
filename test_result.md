@@ -137,5 +137,6 @@ frontend:
 
 agent_communication:
   - agent: "main"
-    message: "Both user-requested fixes implemented. Debug overlay gone. Graph marker now interpolates smoothly between slot positions based on the actual time of the currently-displayed radar frame. Note: marker will only traverse the LEFT half of the chart (≈now-1h to now+30min) because RainViewer's radar coverage is limited to that range, while the chart extends to now+2h (Open-Meteo forecast)."
+    message: "VAPID Web Push system implemented. New Vercel API routes at /app/frontend/api/push/{subscribe,unsubscribe,check,vapid-public-key}.js. Frontend in app/index.tsx now subscribes the device's PushManager with the VAPID public key on permission grant and POSTs the subscription+coords to /api/push/subscribe. SW handler updated to always call showNotification (iOS requirement) and display 'Regn förväntas inom X minuter'. User must set 6 env vars on Vercel + create Upstash Redis + create cron-job.org cron pointing to /api/push/check?secret=... every 5 minutes. Full setup guide in /app/frontend/PUSH_SETUP.md including the generated VAPID keys. Build verified locally (yarn build succeeds, dist/ generates, api/ untouched). Frontend regression-tested: marker still working, 0 page errors."
+
 

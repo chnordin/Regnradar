@@ -1,5 +1,5 @@
 // Regnradar service worker
-const CACHE = 'regnradar-v4';
+const CACHE = 'regnradar-v5';
 const ASSETS = ['/', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
@@ -35,19 +35,40 @@ self.addEventListener('fetch', (event) => {
   }
 });
 
-// Push notification handler
+// Push notification handler.
+// IMPORTANT for iOS Safari 16.4+: every `push` event MUST result in a
+// showNotification() call within the lifetime of the event, or iOS will
+// permanently revoke the site's push permission. We always show *something*.
 self.addEventListener('push', (event) => {
-  let data = { title: 'Regnradar', body: 'Regn närmar sig' };
+  let title = 'Regnradar';
+  let body = 'Regn förväntas inom 20 minuter';
+  let minutes = null;
+  let mmh = null;
   try {
-    if (event.data) data = { ...data, ...event.data.json() };
-  } catch (e) {}
+    if (event.data) {
+      const d = event.data.json();
+      if (d.title) title = d.title;
+      if (d.body) body = d.body;
+      if (typeof d.minutes === 'number') minutes = d.minutes;
+      if (typeof d.mmh === 'number') mmh = d.mmh;
+    }
+  } catch (_) {}
+  // Build a richer body string if the server included intensity/lead-time.
+  let bodyText = body;
+  if (minutes != null) {
+    bodyText = `Regn förväntas inom ${minutes} minut${minutes === 1 ? '' : 'er'}`;
+    if (mmh != null && mmh >= 0.05) {
+      bodyText += ` · ${mmh.toString().replace('.', ',')} mm/h`;
+    }
+  }
   event.waitUntil(
-    self.registration.showNotification(data.title, {
-      body: data.body,
+    self.registration.showNotification(title, {
+      body: bodyText,
       icon: '/icon-192.png',
       badge: '/icon-192.png',
       tag: 'rain-warning',
       renotify: true,
+      data: { url: '/' },
     })
   );
 });
